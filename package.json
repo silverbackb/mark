@@ -1,0 +1,30 @@
+{
+  "name": "@silverbackbase/mark",
+  "version": "0.1.0",
+  "description": "Headless micro-analytics for AI agents — track user behavior without a dashboard",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mark": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "clean": "rm -rf dist"
+  },
+  "files": ["dist"],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "better-sqlite3": "^9.6.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.4.0"
+  }
+}

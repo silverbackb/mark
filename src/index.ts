@@ -14,16 +14,16 @@ import {
   purge,
 } from "./db.js";
 
-const PORT = parseInt(process.env.SPOOR_PORT ?? "7331", 10);
+const PORT = parseInt(process.env.MARK_PORT ?? "7331", 10);
 
 // --- HTTP server for browser event ingestion ---
 
 function trackerScript(slug: string): string {
   return `(function(){
-  var k='_spoor_sid';
+  var k='_mark_sid';
   var sid=sessionStorage.getItem(k)||(Math.random().toString(36).slice(2)+Date.now().toString(36));
   sessionStorage.setItem(k,sid);
-  window.spoor={
+  window.markjs={
     track:function(evt,props){
       fetch('http://localhost:${PORT}/e',{
         method:'POST',
@@ -37,7 +37,7 @@ function trackerScript(slug: string): string {
 }
 
 function htmlSnippet(slug: string): string {
-  return `<script src="http://localhost:${PORT}/spoor.js?slug=${encodeURIComponent(slug)}"></script>`;
+  return `<script src="http://localhost:${PORT}/mark.js?slug=${encodeURIComponent(slug)}"></script>`;
 }
 
 function handleRequest(req: IncomingMessage, res: ServerResponse): void {
@@ -60,7 +60,7 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/spoor.js") {
+  if (req.method === "GET" && url.pathname === "/mark.js") {
     const slug = url.searchParams.get("slug") ?? "default";
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
@@ -190,7 +190,7 @@ function startHttpServer(): void {
   });
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
-      process.stderr.write(`[mark] Port ${PORT} already in use — HTTP ingestion unavailable. Set SPOOR_PORT to override.\n`);
+      process.stderr.write(`[mark] Port ${PORT} already in use — HTTP ingestion unavailable. Set MARK_PORT to override.\n`);
     } else {
       process.stderr.write(`[mark] HTTP server error: ${err.message}\n`);
     }
@@ -214,12 +214,12 @@ async function main(): Promise<void> {
   const server = new McpServer({ name: "mark-mcp-server", version: "0.1.0" });
 
   server.registerTool(
-    "spoor_snippet",
+    "mark_snippet",
     {
       title: "Get Tracking Snippet",
       description: `Generate the HTML <script> tag to embed in your app for event tracking.
 
-Paste the returned snippet before </body>. Once loaded, call window.spoor.track(event_name, properties)
+Paste the returned snippet before </body>. Once loaded, call window.markjs.track(event_name, properties)
 anywhere in your JS to record events. The agent defines all event names — no schema is predefined.
 
 Args:
@@ -229,7 +229,7 @@ Returns:
   {
     "snippet": string,       // <script> tag to paste into your HTML
     "ingestion_url": string, // Direct POST endpoint for programmatic ingestion
-    "usage": string          // Usage example for window.spoor.track
+    "usage": string          // Usage example for window.markjs.track
   }
 
 Examples:
@@ -244,13 +244,13 @@ Examples:
       return ok({
         snippet: htmlSnippet(slug),
         ingestion_url: `http://localhost:${PORT}/e`,
-        usage: `spoor.track('event_name', { optional: 'properties' })`,
+        usage: `markjs.track('event_name', { optional: 'properties' })`,
       });
     }
   );
 
   server.registerTool(
-    "spoor_ingest",
+    "mark_ingest",
     {
       title: "Inject Event",
       description: `Inject a synthetic event directly from the agent. Useful for testing, seeding, or recording agent-side actions.
@@ -285,7 +285,7 @@ Examples:
   );
 
   server.registerTool(
-    "spoor_list",
+    "mark_list",
     {
       title: "List Active Slugs",
       description: `List all slugs that have recorded events, with session and event counts.
@@ -300,7 +300,7 @@ Use when: you want to see what apps are currently being tracked.`,
   );
 
   server.registerTool(
-    "spoor_summary",
+    "mark_summary",
     {
       title: "Get App Summary",
       description: `Get a high-level overview of a slug: total sessions, event count, and top events by frequency.
@@ -329,7 +329,7 @@ Use when: you want a quick health check on an app's usage.`,
   );
 
   server.registerTool(
-    "spoor_funnel",
+    "mark_funnel",
     {
       title: "Measure Funnel Conversion",
       description: `Measure conversion through an ordered list of events. The agent defines the funnel steps — pass the event names in the order users are expected to complete them.
@@ -349,8 +349,8 @@ Returns:
   }
 
 Examples:
-  - spoor_funnel("onboarding", ["page_view", "signup_start", "signup_complete"])
-  - spoor_funnel("checkout", ["add_to_cart", "checkout_start", "payment_entered", "purchase"])
+  - mark_funnel("onboarding", ["page_view", "signup_start", "signup_complete"])
+  - mark_funnel("checkout", ["add_to_cart", "checkout_start", "payment_entered", "purchase"])
 
 Use when: you want to identify where users abandon a multi-step flow.`,
       inputSchema: z.object({
@@ -364,7 +364,7 @@ Use when: you want to identify where users abandon a multi-step flow.`,
   );
 
   server.registerTool(
-    "spoor_compare",
+    "mark_compare",
     {
       title: "Compare Before vs After",
       description: `Compare behavior before and after a date pivot. Useful for measuring the impact of a change.
@@ -405,7 +405,7 @@ Examples:
   );
 
   server.registerTool(
-    "spoor_friction",
+    "mark_friction",
     {
       title: "Find Drop-off Points",
       description: `Identify where users stop progressing. Events are ordered by their average occurrence time, then each step shows how many sessions stopped there.
@@ -428,8 +428,8 @@ Returns:
     ]
   }
 
-Use when: you don't know which step of a flow to investigate — let Spoor surface the friction point.
-Complement with spoor_funnel once you've identified the suspect step.`,
+Use when: you don't know which step of a flow to investigate — let Mark surface the friction point.
+Complement with mark_funnel once you've identified the suspect step.`,
       inputSchema: z.object({
         slug: z.string().min(1).describe("App or page identifier"),
         days: z.number().int().min(1).max(365).optional().default(30).describe("Lookback window in days (default 30)"),
@@ -440,7 +440,7 @@ Complement with spoor_funnel once you've identified the suspect step.`,
   );
 
   server.registerTool(
-    "spoor_purge",
+    "mark_purge",
     {
       title: "Purge Slug Data",
       description: `Delete all event data for a slug. Irreversible — use only to reset a slug during development or testing.

@@ -1,6 +1,6 @@
 {
   "name": "@silverbackbase/mark",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Headless micro-analytics for AI agents — track user behavior without a dashboard",
   "type": "module",
   "main": "dist/index.js",
@@ -12,7 +12,9 @@
     "dev": "tsx src/index.ts",
     "clean": "rm -rf dist"
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "engines": {
     "node": ">=18"
   },

@@ -29,6 +29,12 @@ export function migrate(): void {
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_slug_tag ON events(slug, tag);
     CREATE INDEX IF NOT EXISTS idx_entity ON events(slug, entity_id);
+    CREATE TABLE IF NOT EXISTS snippets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL UNIQUE,
+      slug TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
   `);
 }
 
@@ -79,6 +85,12 @@ export interface FrictionResult {
   total_sessions: number;
   drop_events: FrictionItem[];
   tag?: string;
+}
+
+export interface SnippetRow {
+  url: string;
+  slug: string;
+  created_at: number;
 }
 
 export interface JourneyEvent {
@@ -314,4 +326,37 @@ export function journey(slug: string, entity_id: string, days: number): JourneyR
   }));
 
   return { slug, entity_id, total_events: events.length, events };
+}
+
+// --- Snippets (URL → slug registry) ---
+
+function normalizeUrl(url: string): string {
+  try {
+    const u = new URL(url.trim());
+    return u.origin + u.pathname.replace(/\/$/, "");
+  } catch {
+    return url.trim().replace(/\/$/, "");
+  }
+}
+
+export function registerSnippet(url: string, slug: string): SnippetRow {
+  const normalized = normalizeUrl(url);
+  db.prepare(`
+    INSERT INTO snippets (url, slug, created_at) VALUES (?, ?, ?)
+    ON CONFLICT(url) DO UPDATE SET slug = excluded.slug
+  `).run(normalized, slug, Date.now());
+  return { url: normalized, slug, created_at: Date.now() };
+}
+
+export function resolveUrl(url: string): SnippetRow | null {
+  const normalized = normalizeUrl(url);
+  return db.prepare(
+    `SELECT url, slug, created_at FROM snippets WHERE url = ?`
+  ).get(normalized) as SnippetRow | null;
+}
+
+export function listSnippets(): SnippetRow[] {
+  return db.prepare(
+    `SELECT url, slug, created_at FROM snippets ORDER BY created_at DESC`
+  ).all() as SnippetRow[];
 }

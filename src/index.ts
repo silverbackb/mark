@@ -13,6 +13,9 @@ import {
   friction,
   journey,
   purge,
+  registerSnippet,
+  resolveUrl,
+  listSnippets,
   LIMITS,
 } from "./db.js";
 
@@ -25,23 +28,38 @@ function trackerScript(slug: string): string {
   var k='_mark_sid';
   var sid=sessionStorage.getItem(k)||(Math.random().toString(36).slice(2)+Date.now().toString(36));
   sessionStorage.setItem(k,sid);
+  var _eid=null,_tag=null;
+  function send(evt,props){
+    var payload={slug:'${slug}',session_id:sid,event_name:evt,properties:props||{}};
+    if(_eid) payload.entity_id=_eid;
+    if(_tag) payload.tag=_tag;
+    fetch('http://localhost:${PORT}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
+  }
   window.markjs={
-    _eid:null,
-    _tag:null,
-    identify:function(entityId){ this._eid=entityId||null; },
-    setTag:function(tag){ this._tag=tag||null; },
-    track:function(evt,props){
-      var payload={slug:'${slug}',session_id:sid,event_name:evt,properties:props||{}};
-      if(this._eid) payload.entity_id=this._eid;
-      if(this._tag) payload.tag=this._tag;
-      fetch('http://localhost:${PORT}/e',{
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify(payload),
-        keepalive:true
-      }).catch(function(){});
-    }
+    identify:function(id){ _eid=id||null; },
+    setTag:function(t){ _tag=t||null; },
+    track:send
   };
+  // auto-track page view
+  send('page_view',{title:document.title,url:location.pathname});
+  // auto-track button/link clicks
+  document.addEventListener('click',function(e){
+    var el=e.target.closest('button,a,[role=button],input[type=submit],input[type=button]');
+    if(!el) return;
+    var label=(el.textContent||el.value||el.getAttribute('aria-label')||'').trim().slice(0,60);
+    var tag=el.dataset.markEvent||null;
+    send(tag||'click',{label:label||undefined,id:el.id||undefined,tag:el.dataset.markTag||undefined});
+  });
+  // auto-track form submits
+  document.addEventListener('submit',function(e){
+    var form=e.target;
+    send('form_submit',{id:form.id||undefined,action:form.action||undefined});
+  });
+  // time on page
+  var _start=Date.now();
+  window.addEventListener('beforeunload',function(){
+    send('page_exit',{seconds:Math.round((Date.now()-_start)/1000)});
+  });
 })();`;
 }
 
@@ -253,35 +271,84 @@ async function main(): Promise<void> {
     {
       title: "Get Tracking Snippet",
       description: `Generate the HTML <script> tag to embed in your app for event tracking.
+Optionally registers the URL → slug association so it can be retrieved later with mark_resolve.
 
 Paste the returned snippet before </body>. Once loaded:
 - window.markjs.track(event_name, props) — record an event
 - window.markjs.identify(entityId) — link all subsequent events to an entity (user ID, form ID, etc.)
 - window.markjs.setTag(tag) — tag all subsequent events (e.g. "variant-a", "mobile")
-
-The agent defines all event names — no schema is predefined.
+Auto-tracking: page_view, clicks on buttons/links, form_submit, page_exit are recorded automatically.
 
 Limits: slug max ${LIMITS.slug_max} chars, event_name max ${LIMITS.event_name_max} chars,
 props max ${LIMITS.properties_max_keys} keys, string values max ${LIMITS.property_string_max} chars.
 
 Args:
   - slug (string): Unique identifier for your app or page (e.g. "onboarding", "game-v2")
+  - url (string, optional): URL of the site or page being instrumented — registers the URL→slug mapping for future lookup
 
-Returns: { snippet, ingestion_url, usage }`,
+Returns: { snippet, ingestion_url, usage, registered? }`,
       inputSchema: z.object({
         slug: z.string().min(1).max(100).describe("Unique identifier for the app or page to track"),
+        url: z.string().url().optional().describe("URL of the site being instrumented — registers the URL→slug mapping"),
+      }).strict(),
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ slug, url }) => {
+      const result: Record<string, unknown> = {
+        snippet: htmlSnippet(slug),
+        ingestion_url: `http://localhost:${PORT}/e`,
+        usage: {
+          track: `markjs.track('event_name', { optional: 'props' })`,
+          identify: `markjs.identify('user-123') — link events to an entity`,
+          setTag: `markjs.setTag('variant-a') — tag events for segmentation`,
+        },
+      };
+      if (url) {
+        const reg = registerSnippet(url, slug);
+        result.registered = reg;
+      }
+      return ok(result);
+    }
+  );
+
+  server.registerTool(
+    "mark_resolve",
+    {
+      title: "Resolve URL to Slug",
+      description: `Look up the slug registered for a given URL.
+Use before instrumenting a site to check if it's already been set up, and retrieve the correct slug.
+
+Args:
+  - url (string): URL to look up (exact match after normalization — trailing slash ignored, fragment ignored)
+
+Returns: { url, slug, created_at } if found, or { found: false } if no snippet is registered for this URL.
+
+Use when: you're about to instrument a site and want to know if a slug already exists for it.
+Complement with mark_list_snippets to see all registered URLs.`,
+      inputSchema: z.object({
+        url: z.string().min(1).describe("URL to look up"),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug }) => ok({
-      snippet: htmlSnippet(slug),
-      ingestion_url: `http://localhost:${PORT}/e`,
-      usage: {
-        track: `markjs.track('event_name', { optional: 'props' })`,
-        identify: `markjs.identify('user-123') — link events to an entity`,
-        setTag: `markjs.setTag('variant-a') — tag events for segmentation`,
-      },
-    })
+    async ({ url }) => {
+      const row = resolveUrl(url);
+      return ok(row ?? { found: false, url });
+    }
+  );
+
+  server.registerTool(
+    "mark_list_snippets",
+    {
+      title: "List Registered Snippets",
+      description: `List all URL→slug registrations, ordered by most recently created.
+
+Returns: Array of { url, slug, created_at }
+
+Use when: you want to see which sites have been instrumented and which slug each one uses.`,
+      inputSchema: z.object({}).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => ok(listSnippets())
   );
 
   server.registerTool(

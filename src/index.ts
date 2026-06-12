@@ -227,6 +227,28 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
         json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
         return;
       }
+      // Fire billing callback if configured
+      const eventDebitUrl = process.env.SILVERBACKBASE_EVENT_DEBIT_URL;
+      const eventDebitSecret = process.env.SILVERBACKBASE_EVENT_DEBIT_SECRET;
+      if (eventDebitUrl && eventDebitSecret && workspace_id !== "local") {
+        try {
+          const billRes = await fetch(eventDebitUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-internal-event-secret": eventDebitSecret,
+            },
+            body: JSON.stringify({ workspace_id, event_name }),
+          });
+          if (billRes.status === 402) {
+            json(res, { error: "Insufficient balance" }, 402);
+            return;
+          }
+          // 401 or other errors → still accept event (don't block tracking on billing misconfiguration)
+        } catch {
+          // Network error → accept event anyway (don't break tracking)
+        }
+      }
       await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
       json(res, { ok: true });
     } catch {

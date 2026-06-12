@@ -243,4 +243,17 @@ export async function listSnippets() {
     const rows = await sql `SELECT url, slug, created_at FROM snippets ORDER BY created_at DESC`;
     return rows.map(r => ({ url: r.url, slug: r.slug, created_at: Number(r.created_at) }));
 }
+export async function recentEvents(limit = 50) {
+    const rows = await sql `
+    SELECT ts, event_name, session_id, slug, tag
+    FROM events ORDER BY ts DESC LIMIT ${limit}
+  `;
+    return rows.map(r => ({
+        ts: Number(r.ts),
+        event_name: r.event_name,
+        session_id: r.session_id,
+        slug: r.slug,
+        tag: (r.tag ?? null),
+    }));
+}
 //# sourceMappingURL=db.js.map

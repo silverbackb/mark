@@ -95,4 +95,12 @@ export declare function journey(slug: string, entity_id: string, days: number): 
 export declare function registerSnippet(url: string, slug: string): Promise<SnippetRow>;
 export declare function resolveUrl(url: string): Promise<SnippetRow | null>;
 export declare function listSnippets(): Promise<SnippetRow[]>;
+export interface RecentEvent {
+    ts: number;
+    event_name: string;
+    session_id: string;
+    slug: string;
+    tag: string | null;
+}
+export declare function recentEvents(limit?: number): Promise<RecentEvent[]>;
 //# sourceMappingURL=db.d.ts.map

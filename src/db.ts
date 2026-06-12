@@ -343,3 +343,25 @@ export async function listSnippets(): Promise<SnippetRow[]> {
   const rows = await sql`SELECT url, slug, created_at FROM snippets ORDER BY created_at DESC`;
   return rows.map(r => ({ url: r.url as string, slug: r.slug as string, created_at: Number(r.created_at) }));
 }
+
+export interface RecentEvent {
+  ts: number;
+  event_name: string;
+  session_id: string;
+  slug: string;
+  tag: string | null;
+}
+
+export async function recentEvents(limit = 50): Promise<RecentEvent[]> {
+  const rows = await sql`
+    SELECT ts, event_name, session_id, slug, tag
+    FROM events ORDER BY ts DESC LIMIT ${limit}
+  `;
+  return rows.map(r => ({
+    ts: Number(r.ts),
+    event_name: r.event_name as string,
+    session_id: r.session_id as string,
+    slug: r.slug as string,
+    tag: (r.tag ?? null) as string | null,
+  }));
+}

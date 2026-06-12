@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "node:http";
 import { z } from "zod";
-import { migrate, insertEvent, listSlugs, summary, funnel, compare, friction, journey, purge, registerSnippet, resolveUrl, listSnippets, LIMITS, } from "./db.js";
+import { migrate, insertEvent, listSlugs, summary, funnel, compare, friction, journey, purge, registerSnippet, resolveUrl, listSnippets, recentEvents, LIMITS, } from "./db.js";
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // --- HTTP tracker script ---
@@ -50,7 +50,12 @@ function htmlSnippet(slug) {
     return `<script src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}"></script>`;
 }
 // --- HTTP server ---
-function handleRequest(req, res) {
+function json(res, data, status = 200) {
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(status);
+    res.end(JSON.stringify(data));
+}
+async function handleRequestAsync(req, res) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -61,9 +66,7 @@ function handleRequest(req, res) {
     }
     const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
     if (req.method === "GET" && url.pathname === "/health") {
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify({ ok: true, port: PORT }));
+        json(res, { ok: true, port: PORT });
         return;
     }
     if (req.method === "GET" && url.pathname === "/mark.js") {
@@ -76,9 +79,12 @@ function handleRequest(req, res) {
     }
     // --- Query endpoints ---
     if (req.method === "GET" && url.pathname === "/q/list") {
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify(listSlugs()));
+        json(res, await listSlugs());
+        return;
+    }
+    if (req.method === "GET" && url.pathname === "/logs/recent") {
+        const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 200);
+        json(res, await recentEvents(limit));
         return;
     }
     const summaryMatch = url.pathname.match(/^\/q\/summary\/(.+)$/);
@@ -86,9 +92,7 @@ function handleRequest(req, res) {
         const slug = decodeURIComponent(summaryMatch[1]);
         const days = parseInt(url.searchParams.get("days") ?? "7", 10);
         const tag = url.searchParams.get("tag") ?? undefined;
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify(summary(slug, isNaN(days) ? 7 : days, tag)));
+        json(res, await summary(slug, isNaN(days) ? 7 : days, tag));
         return;
     }
     const funnelMatch = url.pathname.match(/^\/q\/funnel\/(.+)$/);
@@ -99,13 +103,10 @@ function handleRequest(req, res) {
         const days = parseInt(url.searchParams.get("days") ?? "30", 10);
         const tag = url.searchParams.get("tag") ?? undefined;
         if (steps.length < 2) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ error: "steps param requires at least 2 comma-separated event names" }));
+            json(res, { error: "steps param requires at least 2 comma-separated event names" }, 400);
             return;
         }
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify(funnel(slug, steps, isNaN(days) ? 30 : days, tag)));
+        json(res, await funnel(slug, steps, isNaN(days) ? 30 : days, tag));
         return;
     }
     const compareMatch = url.pathname.match(/^\/q\/compare\/(.+)$/);
@@ -113,17 +114,14 @@ function handleRequest(req, res) {
         const slug = decodeURIComponent(compareMatch[1]);
         const pivot = url.searchParams.get("pivot") ?? "";
         if (!pivot || isNaN(new Date(pivot).getTime())) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ error: "pivot param required — ISO date e.g. 2026-06-01" }));
+            json(res, { error: "pivot param required — ISO date e.g. 2026-06-01" }, 400);
             return;
         }
         const event = url.searchParams.get("event") ?? null;
         const daysBefore = parseInt(url.searchParams.get("days_before") ?? "14", 10);
         const daysAfter = parseInt(url.searchParams.get("days_after") ?? "14", 10);
         const tag = url.searchParams.get("tag") ?? undefined;
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify(compare(slug, pivot, event, isNaN(daysBefore) ? 14 : daysBefore, isNaN(daysAfter) ? 14 : daysAfter, tag)));
+        json(res, await compare(slug, pivot, event, isNaN(daysBefore) ? 14 : daysBefore, isNaN(daysAfter) ? 14 : daysAfter, tag));
         return;
     }
     const frictionMatch = url.pathname.match(/^\/q\/friction\/(.+)$/);
@@ -131,9 +129,7 @@ function handleRequest(req, res) {
         const slug = decodeURIComponent(frictionMatch[1]);
         const days = parseInt(url.searchParams.get("days") ?? "30", 10);
         const tag = url.searchParams.get("tag") ?? undefined;
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify(friction(slug, isNaN(days) ? 30 : days, tag)));
+        json(res, await friction(slug, isNaN(days) ? 30 : days, tag));
         return;
     }
     const journeyMatch = url.pathname.match(/^\/q\/journey\/(.+)$/);
@@ -141,20 +137,15 @@ function handleRequest(req, res) {
         const slug = decodeURIComponent(journeyMatch[1]);
         const entity_id = url.searchParams.get("entity_id") ?? "";
         if (!entity_id) {
-            res.writeHead(400);
-            res.end(JSON.stringify({ error: "entity_id param required" }));
+            json(res, { error: "entity_id param required" }, 400);
             return;
         }
         const days = parseInt(url.searchParams.get("days") ?? "30", 10);
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify(journey(slug, entity_id, isNaN(days) ? 30 : days)));
+        json(res, await journey(slug, entity_id, isNaN(days) ? 30 : days));
         return;
     }
     if (req.method === "GET" && url.pathname === "/q/schema") {
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify({
+        json(res, {
             limits: LIMITS,
             endpoints: [
                 {
@@ -162,6 +153,7 @@ function handleRequest(req, res) {
                     body: { slug: "string", session_id: "string", event_name: "string", properties: "object?", tag: "string?", entity_id: "string?", ts: "number? (unix ms)" },
                     description: "Ingest an event",
                 },
+                { method: "GET", path: "/logs/recent", params: { limit: "number (default 50, max 200)" }, description: "Recent events across all slugs" },
                 { method: "GET", path: "/q/list", description: "List active slugs" },
                 { method: "GET", path: "/q/summary/:slug", params: { days: "number (default 7)", tag: "string?" }, description: "Session and event overview" },
                 { method: "GET", path: "/q/funnel/:slug", params: { steps: "comma-separated event names (min 2)", days: "number (default 30)", tag: "string?" }, description: "Funnel conversion by step" },
@@ -169,42 +161,42 @@ function handleRequest(req, res) {
                 { method: "GET", path: "/q/friction/:slug", params: { days: "number (default 30)", tag: "string?" }, description: "Drop-off points by event sequence" },
                 { method: "GET", path: "/q/journey/:slug", params: { entity_id: "string (required)", days: "number (default 30)" }, description: "All events for a specific entity" },
             ],
-        }));
+        });
         return;
     }
     // --- Ingestion ---
     if (req.method === "POST" && url.pathname === "/e") {
-        let body = "";
-        req.on("data", (chunk) => { body += chunk.toString(); });
-        req.on("end", () => {
-            try {
-                const parsed = JSON.parse(body);
-                const { slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
-                if (!slug || !session_id || !event_name) {
-                    res.writeHead(400);
-                    res.end(JSON.stringify({ error: "Missing required fields: slug, session_id, event_name" }));
-                    return;
-                }
-                insertEvent(slug, session_id, event_name, properties ?? {}, tag, entity_id, ts)
-                    .then(() => {
-                    res.setHeader("Content-Type", "application/json");
-                    res.writeHead(200);
-                    res.end(JSON.stringify({ ok: true }));
-                })
-                    .catch((e) => {
-                    res.writeHead(500);
-                    res.end(JSON.stringify({ error: e instanceof Error ? e.message : "internal error" }));
-                });
-            }
-            catch {
-                res.writeHead(400);
-                res.end(JSON.stringify({ error: "Invalid JSON" }));
-            }
+        const body = await new Promise((resolve, reject) => {
+            let data = "";
+            req.on("data", (chunk) => { data += chunk.toString(); });
+            req.on("end", () => resolve(data));
+            req.on("error", reject);
         });
+        try {
+            const parsed = JSON.parse(body);
+            const { slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
+            if (!slug || !session_id || !event_name) {
+                json(res, { error: "Missing required fields: slug, session_id, event_name" }, 400);
+                return;
+            }
+            await insertEvent(slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
+            json(res, { ok: true });
+        }
+        catch {
+            json(res, { error: "Invalid JSON" }, 400);
+        }
         return;
     }
     res.writeHead(404);
     res.end("Not found");
+}
+function handleRequest(req, res) {
+    handleRequestAsync(req, res).catch((e) => {
+        if (!res.headersSent) {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: e instanceof Error ? e.message : "internal error" }));
+        }
+    });
 }
 function startHttpServer() {
     const server = createServer(handleRequest);

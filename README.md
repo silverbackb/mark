@@ -49,7 +49,7 @@ Paste before `</body>` on every page:
 
 `slug` identifies the site. `wid` is your workspace ID — use any consistent string.
 
-Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `form_submit`, `page_exit`. Custom events:
+Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `form_submit`, `page_exit`, and `scroll_depth` at 25/50/75/100%. Custom events:
 
 ```js
 window.markjs.track('signup_complete', { plan: 'pro' })
@@ -60,6 +60,9 @@ window.markjs.setTag('variant-a')    // tag events for segmentation
 ### 4. Query from the agent
 
 ```
+mark_funnel("my-site", ["page_view", "scroll_50", "scroll_100"])
+// → { drop_at: "scroll_100", rates: [1.0, 0.61, 0.28] }
+
 mark_funnel("my-site", ["page_view", "form_submit", "merci"])
 // → { drop_at: "form_submit", rates: [1.0, 0.43, 0.31] }
 

@@ -1,70 +1,72 @@
 # @silverbackbase/mark
 
-Headless micro-analytics for AI agents. No dashboard. No UI. An agent instruments your app, users interact with it, the agent reads the data and iterates.
+Headless micro-analytics for AI agents. A one-line snippet on your site, and your agent reads visitor behavior directly — no dashboard, no UI.
 
-```
-npm install -g @silverbackbase/mark
-```
-
----
-
-## The problem
-
-When an AI agent builds or iterates on an app, it has no way to observe what users actually do after delivery. It can add console.log, ask a human to test manually, or ignore post-delivery behavior entirely. There is no feedback loop between the app and the agent.
-
-Mark closes that loop.
+Part of [SilverBackBase](https://silverbackbase.com) — a library of agent-first primitives for AI-powered marketing and product work.
 
 ---
 
 ## How it works
 
-Mark runs a local server with two surfaces:
+Mark has two surfaces:
 
-- **HTTP on port 7331** — accepts events from any browser app via a one-line JS snippet, and exposes query endpoints callable by any LLM with function calling
-- **MCP stdio** — exposes 8 tools for Claude Code, Codex/Antigravity CLI, and Claude Desktop
+- **HTTP server** — accepts events from any browser via a one-line JS snippet, and exposes query endpoints for agents or any LLM with function calling
+- **MCP stdio** — exposes tools for Claude Code, Codex CLI, and Claude Desktop
 
-Data is stored in `~/.mark/mark.db` (SQLite, WAL mode). No cloud, no auth, no retention policy.
+Data is stored in PostgreSQL, isolated by `workspace_id`. Every event is scoped to a workspace.
 
 ---
 
-## Quick start
+## Self-hosted quick start
 
-### 1. Start the server
+### 1. Requirements
+
+- Node.js 18+
+- PostgreSQL database (`DATABASE_URL` env var)
+
+### 2. Start the server
 
 ```bash
-npx @silverbackbase/mark
+npx -y @silverbackbase/mark
 ```
 
-Or install globally and run `mark`. The server starts on port 7331 and the MCP stdio interface is ready.
+Or install globally:
 
-### 2. Instrument your app
+```bash
+npm install -g @silverbackbase/mark
+mark
+```
 
-Ask your agent to call `mark_snippet` with a slug. It returns a `<script>` tag to paste before `</body>`:
+The server starts on the port defined by `PORT` (default 7331). Migrations run automatically on startup.
+
+### 3. Add the snippet to your site
+
+Paste before `</body>` on every page. Replace `your-workspace-id` with any stable identifier for your workspace:
 
 ```html
-<script src="http://localhost:7331/mark.js?slug=my-app"></script>
+<script src="https://your-instance.com/mark.js?slug=my-site&wid=your-workspace-id"></script>
 ```
 
-Once loaded, call `window.markjs.track()` anywhere in your JS:
+Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `form_submit`, `page_exit`. You can also track custom events:
 
 ```js
-window.markjs.track('signup_start')
-window.markjs.track('step_2', { method: 'google' })
-window.markjs.track('purchase', { plan: 'pro', amount: 49 })
+window.markjs.track('signup_complete', { plan: 'pro' })
+window.markjs.identify('user-123')   // link events to an entity
+window.markjs.setTag('variant-a')    // tag events for segmentation
 ```
 
-The agent defines all event names. No schema, no predefined taxonomy.
+### 4. Query from the agent
 
-### 3. Query from the agent
+Ask your agent to call `mark_summary`, `mark_funnel`, `mark_friction`, etc. Examples:
 
 ```
-mark_funnel("my-app", ["signup_start", "step_2", "purchase"])
-// → { drop_at: "step_2", rates: [1.0, 0.62, 0.31] }
+mark_funnel("my-site", ["page_view", "form_submit", "merci"])
+// → { drop_at: "form_submit", rates: [1.0, 0.43, 0.31] }
 
-mark_friction("my-app")
+mark_friction("my-site")
 // → where sessions stop, ordered by sequence
 
-mark_compare("my-app", pivot="2026-06-01", event="purchase")
+mark_compare("my-site", pivot="2026-06-01", event="form_submit")
 // → { before: { completions: 48 }, after: { completions: 71 }, delta: "+47.9%" }
 ```
 
@@ -72,70 +74,81 @@ mark_compare("my-app", pivot="2026-06-01", event="purchase")
 
 ## MCP tools
 
-| Tool | What it does |
+| Tool | Description |
 |------|-------------|
-| `mark_snippet` | Returns the `<script>` tag to embed in your app |
+| `mark_snippet` | Returns the `<script>` tag to embed on the site |
 | `mark_ingest` | Injects a synthetic event from the agent (testing, seeding) |
 | `mark_list` | Lists all active slugs with session and event counts |
-| `mark_summary` | Overview of a slug: sessions, events, top events |
+| `mark_summary` | Overview: sessions, events, top events over N days |
 | `mark_funnel` | Conversion rate through an ordered list of events |
 | `mark_compare` | Behavior before vs after a date pivot |
 | `mark_friction` | Where sessions stop progressing |
-| `mark_purge` | Delete all data for a slug |
+| `mark_journey` | Full event history for a specific entity |
+| `mark_purge` | Delete all data for a slug (irreversible) |
 
 ---
 
 ## HTTP endpoints
 
-For local LLMs with function calling (Ollama, LM Studio, etc.) — no MCP required.
-
 ```
-POST /e                              Ingest an event
-GET  /mark.js?slug=:slug             Serve the browser tracker script
-GET  /q/list                         List active slugs
-GET  /q/summary/:slug?days=7         Session and event overview
-GET  /q/funnel/:slug?steps=a,b,c     Funnel conversion by step
-GET  /q/compare/:slug?pivot=ISO      Before vs after comparison
-GET  /q/friction/:slug               Drop-off points
-GET  /q/schema                       Full endpoint schema (auto-discovery)
+POST /e                                  Ingest an event (open — called from browsers)
+GET  /mark.js?slug=:slug&wid=:wid        Serve the browser tracker script
+GET  /health                             Health check
+GET  /logs/recent?limit=50               Recent events (requires x-internal-secret if set)
+GET  /q/list                             List active slugs (requires x-internal-secret if set)
+GET  /q/summary/:slug?days=7             Session and event overview
+GET  /q/funnel/:slug?steps=a,b,c         Funnel conversion by step
+GET  /q/compare/:slug?pivot=ISO          Before vs after comparison
+GET  /q/friction/:slug                   Drop-off points
+GET  /q/journey/:slug?entity_id=ID       Entity event history
+GET  /q/schema                           Full endpoint schema
 ```
 
-Event ingestion payload:
+### Event ingestion payload (`POST /e`)
 
 ```json
 {
-  "slug": "my-app",
+  "workspace_id": "your-workspace-id",
+  "slug": "my-site",
   "session_id": "abc123",
   "event_name": "signup_start",
-  "properties": { "optional": "metadata" }
+  "properties": { "optional": "metadata" },
+  "tag": "variant-a",
+  "entity_id": "user-123"
 }
 ```
 
+`workspace_id` is required — all data is isolated per workspace.
+
 ---
 
-## MCP configuration (Claude Code)
+## Environment variables
 
-Add to `~/.claude.json`:
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL` | Yes | PostgreSQL connection string |
+| `PORT` | No | HTTP server port (default 7331) |
+| `MARK_PUBLIC_URL` | No | Public base URL for snippet generation (default `http://localhost:PORT`) |
+| `MARK_INTERNAL_SECRET` | No | Secret header required on query endpoints (`/q/*`, `/logs/*`). If empty, query endpoints are open (self-hosted default). |
+| `MARK_WORKSPACE_ID` | No | Workspace ID used by MCP stdio tools (default `"local"`) |
+
+---
+
+## MCP configuration (self-hosted)
+
+### Claude Code / Claude Desktop
 
 ```json
 {
   "mcpServers": {
     "mark": {
-      "command": "node",
-      "args": ["/path/to/mark/dist/index.js"],
-      "env": { "MARK_PORT": "7331" }
-    }
-  }
-}
-```
-
-Or if installed globally:
-
-```json
-{
-  "mcpServers": {
-    "mark": {
-      "command": "mark"
+      "command": "npx",
+      "args": ["-y", "@silverbackbase/mark"],
+      "env": {
+        "DATABASE_URL": "postgresql://user:pass@host/db",
+        "MARK_PUBLIC_URL": "https://your-instance.com",
+        "MARK_WORKSPACE_ID": "your-workspace-id"
+      }
     }
   }
 }
@@ -143,46 +156,14 @@ Or if installed globally:
 
 ---
 
-## Auto-start on macOS
+## Security model
 
-To keep the HTTP server running at all times (useful when using Mark with local LLMs):
-
-```bash
-cat > ~/Library/LaunchAgents/com.silverbackbase.mark.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.silverbackbase.mark</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/node</string>
-    <string>/usr/local/lib/node_modules/@silverbackbase/mark/dist/index.js</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict>
-</plist>
-EOF
-
-launchctl load ~/Library/LaunchAgents/com.silverbackbase.mark.plist
-```
-
----
-
-## What Mark does not do
-
-- No UI, no dashboard, no graphs
-- No user authentication
-- No cross-domain tracking
-- No named user sessions (anonymous IDs only)
-- No guaranteed retention (purge available per slug)
-- No predefined event schema
+- **Ingestion** (`POST /e`, `/mark.js`): always open — called from visitor browsers, no auth possible.
+- **Query endpoints** (`/q/*`, `/logs/*`): protected by `x-internal-secret` header when `MARK_INTERNAL_SECRET` is set. In self-hosted mode with no secret set, query endpoints are open.
+- **Data isolation**: every event and snippet is scoped to a `workspace_id`. Queries only return data for the `workspace_id` passed via `x-workspace-id` header.
 
 ---
 
 ## Part of SilverBackBase
 
-Mark is a primitive in the [SilverBackBase](https://silverbackbase.com) ecosystem — a library of agent-first tools for AI-powered marketing and product work.
-
-Related primitives: [Trail](https://silverbackbase.com) (marketing attribution), [Range](https://silverbackbase.com) (local SEO position tracking), [Root](https://silverbackbase.com) (business memory).
+Related primitives: [Trail](https://silverbackbase.com) (multi-touch attribution), [Range](https://silverbackbase.com) (local SEO position tracking), [Root](https://silverbackbase.com) (business memory).

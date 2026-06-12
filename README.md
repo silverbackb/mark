@@ -13,16 +13,16 @@ Mark has two surfaces:
 - **HTTP server** — accepts events from any browser via a one-line JS snippet, and exposes query endpoints for agents or any LLM with function calling
 - **MCP stdio** — exposes tools for Claude Code, Codex CLI, and Claude Desktop
 
-Data is stored in PostgreSQL, isolated by `workspace_id`. Every event is scoped to a workspace.
+Data is stored in PostgreSQL. Every event is scoped to a `workspace_id` — a string you choose freely (e.g. `"local"`, `"my-project"`).
 
 ---
 
-## Self-hosted quick start
+## Quick start
 
 ### 1. Requirements
 
 - Node.js 18+
-- PostgreSQL database (`DATABASE_URL` env var)
+- PostgreSQL database
 
 ### 2. Start the server
 
@@ -41,13 +41,15 @@ The server starts on the port defined by `PORT` (default 7331). Migrations run a
 
 ### 3. Add the snippet to your site
 
-Paste before `</body>` on every page. Replace `your-workspace-id` with any stable identifier for your workspace:
+Paste before `</body>` on every page:
 
 ```html
-<script src="https://your-instance.com/mark.js?slug=my-site&wid=your-workspace-id"></script>
+<script src="https://your-instance.com/mark.js?slug=my-site&wid=local"></script>
 ```
 
-Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `form_submit`, `page_exit`. You can also track custom events:
+`slug` identifies the site. `wid` is your workspace ID — use any consistent string.
+
+Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `form_submit`, `page_exit`. Custom events:
 
 ```js
 window.markjs.track('signup_complete', { plan: 'pro' })
@@ -56,8 +58,6 @@ window.markjs.setTag('variant-a')    // tag events for segmentation
 ```
 
 ### 4. Query from the agent
-
-Ask your agent to call `mark_summary`, `mark_funnel`, `mark_friction`, etc. Examples:
 
 ```
 mark_funnel("my-site", ["page_view", "form_submit", "merci"])
@@ -94,8 +94,8 @@ mark_compare("my-site", pivot="2026-06-01", event="form_submit")
 POST /e                                  Ingest an event (open — called from browsers)
 GET  /mark.js?slug=:slug&wid=:wid        Serve the browser tracker script
 GET  /health                             Health check
-GET  /logs/recent?limit=50               Recent events (requires x-internal-secret if set)
-GET  /q/list                             List active slugs (requires x-internal-secret if set)
+GET  /logs/recent?limit=50               Recent events
+GET  /q/list                             List active slugs
 GET  /q/summary/:slug?days=7             Session and event overview
 GET  /q/funnel/:slug?steps=a,b,c         Funnel conversion by step
 GET  /q/compare/:slug?pivot=ISO          Before vs after comparison
@@ -108,7 +108,7 @@ GET  /q/schema                           Full endpoint schema
 
 ```json
 {
-  "workspace_id": "your-workspace-id",
+  "workspace_id": "local",
   "slug": "my-site",
   "session_id": "abc123",
   "event_name": "signup_start",
@@ -118,7 +118,7 @@ GET  /q/schema                           Full endpoint schema
 }
 ```
 
-`workspace_id` is required — all data is isolated per workspace.
+`workspace_id` is required — all data is scoped by it.
 
 ---
 
@@ -129,14 +129,16 @@ GET  /q/schema                           Full endpoint schema
 | `DATABASE_URL` | Yes | PostgreSQL connection string |
 | `PORT` | No | HTTP server port (default 7331) |
 | `MARK_PUBLIC_URL` | No | Public base URL for snippet generation (default `http://localhost:PORT`) |
-| `MARK_INTERNAL_SECRET` | No | Secret header required on query endpoints (`/q/*`, `/logs/*`). If empty, query endpoints are open (self-hosted default). |
 | `MARK_WORKSPACE_ID` | No | Workspace ID used by MCP stdio tools (default `"local"`) |
+| `MARK_INTERNAL_SECRET` | No | If set, query endpoints (`/q/*`, `/logs/*`) require `x-internal-secret: <value>`. Ingestion (`POST /e`) and `/mark.js` remain open. |
 
 ---
 
-## MCP configuration (self-hosted)
+## MCP configuration
 
-### Claude Code / Claude Desktop
+### Claude Code
+
+Add to `~/.claude.json`:
 
 ```json
 {
@@ -147,20 +149,34 @@ GET  /q/schema                           Full endpoint schema
       "env": {
         "DATABASE_URL": "postgresql://user:pass@host/db",
         "MARK_PUBLIC_URL": "https://your-instance.com",
-        "MARK_WORKSPACE_ID": "your-workspace-id"
+        "MARK_WORKSPACE_ID": "local"
       }
     }
   }
 }
 ```
 
+### Claude Desktop
+
+Same config in `~/Library/Application Support/Claude/claude_desktop_config.json`.
+
 ---
 
-## Security model
+## Anti-adblock (optional)
 
-- **Ingestion** (`POST /e`, `/mark.js`): always open — called from visitor browsers, no auth possible.
-- **Query endpoints** (`/q/*`, `/logs/*`): protected by `x-internal-secret` header when `MARK_INTERNAL_SECRET` is set. In self-hosted mode with no secret set, query endpoints are open.
-- **Data isolation**: every event and snippet is scoped to a `workspace_id`. Queries only return data for the `workspace_id` passed via `x-workspace-id` header.
+Ad blockers may block requests to `mark.silverbackbase.com`. To proxy through your own domain, add a rewrite rule in your Next.js config:
+
+```js
+// next.config.js
+rewrites: async () => [
+  {
+    source: "/m/:path*",
+    destination: "https://your-instance.com/:path*",
+  },
+]
+```
+
+Then update your snippet to use `/m/mark.js` and `/m/e` as the ingestion endpoint.
 
 ---
 

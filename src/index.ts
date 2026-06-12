@@ -59,6 +59,17 @@ function trackerScript(slug: string, wid: string): string {
     var form=e.target;
     send('form_submit',{id:form.id||undefined,action:form.action||undefined});
   });
+  // scroll depth (25/50/75/100)
+  var _scrollFired={};
+  window.addEventListener('scroll',function(){
+    var el=document.documentElement;
+    var scrollable=el.scrollHeight-el.clientHeight;
+    if(scrollable<=0) return;
+    var pct=Math.round(window.scrollY/scrollable*100);
+    [25,50,75,100].forEach(function(t){
+      if(pct>=t&&!_scrollFired[t]){_scrollFired[t]=true;send('scroll_depth',{percent:t});}
+    });
+  },{passive:true});
   // time on page
   var _start=Date.now();
   window.addEventListener('beforeunload',function(){

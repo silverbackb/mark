@@ -44,7 +44,7 @@ The server starts on the port defined by `PORT` (default 7331). Migrations run a
 Paste before `</body>` on every page:
 
 ```html
-<script src="https://your-instance.com/mark.js?slug=my-site&wid=local"></script>
+<script async src="https://your-instance.com/mark.js?slug=my-site&wid=local"></script>
 ```
 
 `slug` identifies the site. `wid` is your workspace ID — use any consistent string.

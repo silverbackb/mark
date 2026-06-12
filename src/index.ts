@@ -78,7 +78,7 @@ function trackerScript(slug: string, wid: string): string {
 }
 
 function htmlSnippet(slug: string, wid: string): string {
-  return `<script src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
+  return `<script async src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
 }
 
 // --- HTTP server ---

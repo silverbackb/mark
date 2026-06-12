@@ -28,6 +28,7 @@ export async function migrate() {
     await sql `
     CREATE TABLE IF NOT EXISTS events (
       id BIGSERIAL PRIMARY KEY,
+      workspace_id TEXT NOT NULL DEFAULT '',
       slug TEXT NOT NULL,
       session_id TEXT NOT NULL,
       event_name TEXT NOT NULL,
@@ -37,6 +38,10 @@ export async function migrate() {
       ts BIGINT NOT NULL
     )
   `;
+    // Add workspace_id to existing tables that were created before this migration
+    await sql `ALTER TABLE events ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''`;
+    await sql `CREATE INDEX IF NOT EXISTS idx_workspace ON events(workspace_id)`;
+    await sql `CREATE INDEX IF NOT EXISTS idx_workspace_slug ON events(workspace_id, slug)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_slug ON events(slug)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_slug_event ON events(slug, event_name)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_slug_ts ON events(slug, ts)`;
@@ -45,24 +50,34 @@ export async function migrate() {
     await sql `
     CREATE TABLE IF NOT EXISTS snippets (
       id BIGSERIAL PRIMARY KEY,
-      url TEXT NOT NULL UNIQUE,
+      workspace_id TEXT NOT NULL DEFAULT '',
+      url TEXT NOT NULL,
       slug TEXT NOT NULL,
-      created_at BIGINT NOT NULL
+      created_at BIGINT NOT NULL,
+      UNIQUE(workspace_id, url)
     )
+  `;
+    await sql `ALTER TABLE snippets ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''`;
+    // Drop old unique constraint on url alone if it exists, replace with (workspace_id, url)
+    await sql `
+    DO $$ BEGIN
+      ALTER TABLE snippets DROP CONSTRAINT IF EXISTS snippets_url_key;
+    EXCEPTION WHEN others THEN NULL;
+    END $$
   `;
 }
 // =============================================================================
 // MUTATIONS
 // =============================================================================
-export async function insertEvent(slug, session_id, event_name, properties = {}, tag, entity_id, ts) {
+export async function insertEvent(workspaceId, slug, session_id, event_name, properties = {}, tag, entity_id, ts) {
     await sql `
-    INSERT INTO events (slug, session_id, event_name, properties, ts, tag, entity_id)
-    VALUES (${slug}, ${session_id}, ${event_name}, ${properties}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null})
+    INSERT INTO events (workspace_id, slug, session_id, event_name, properties, ts, tag, entity_id)
+    VALUES (${workspaceId}, ${slug}, ${session_id}, ${event_name}, ${properties}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null})
   `;
 }
-export async function purge(slug) {
+export async function purge(workspaceId, slug) {
     const result = await sql `
-    WITH deleted AS (DELETE FROM events WHERE slug = ${slug} RETURNING 1)
+    WITH deleted AS (DELETE FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} RETURNING 1)
     SELECT COUNT(*) AS n FROM deleted
   `;
     return { deleted: Number(result[0].n) };
@@ -70,13 +85,14 @@ export async function purge(slug) {
 // =============================================================================
 // QUERIES
 // =============================================================================
-export async function listSlugs() {
+export async function listSlugs(workspaceId) {
     const rows = await sql `
     SELECT slug,
            COUNT(DISTINCT session_id) AS sessions,
            COUNT(*) AS events,
            MAX(ts) AS last_event_ts
     FROM events
+    WHERE workspace_id = ${workspaceId}
     GROUP BY slug
     ORDER BY last_event_ts DESC
   `;
@@ -87,16 +103,16 @@ export async function listSlugs() {
         last_event_ts: Number(r.last_event_ts),
     }));
 }
-export async function summary(slug, days, tag) {
+export async function summary(workspaceId, slug, days, tag) {
     const since = Date.now() - days * 86_400_000;
     const t = tag ?? null;
     const [agg] = await sql `
     SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS events
-    FROM events WHERE slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
   `;
     const top = await sql `
     SELECT event_name AS event, COUNT(*) AS count
-    FROM events WHERE slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
     GROUP BY event_name ORDER BY count DESC LIMIT 10
   `;
     return {
@@ -108,7 +124,7 @@ export async function summary(slug, days, tag) {
         ...(tag ? { tag } : {}),
     };
 }
-export async function funnel(slug, steps, days, tag) {
+export async function funnel(workspaceId, slug, steps, days, tag) {
     const since = Date.now() - days * 86_400_000;
     const t = tag ?? null;
     const counts = [];
@@ -117,7 +133,7 @@ export async function funnel(slug, steps, days, tag) {
         if (sub.length === 1) {
             const [row] = await sql `
         SELECT COUNT(DISTINCT session_id) AS n FROM events
-        WHERE slug = ${slug} AND event_name = ${sub[0]} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+        WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${sub[0]} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
       `;
             counts.push(Number(row.n ?? 0));
         }
@@ -125,7 +141,7 @@ export async function funnel(slug, steps, days, tag) {
             const [row] = await sql `
         SELECT COUNT(*) AS n FROM (
           SELECT session_id FROM events
-          WHERE slug = ${slug} AND event_name = ANY(${sub}) AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+          WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ANY(${sub}) AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
           GROUP BY session_id HAVING COUNT(DISTINCT event_name) = ${sub.length}
         ) sub
       `;
@@ -145,20 +161,20 @@ export async function funnel(slug, steps, days, tag) {
     }
     return { slug, steps, counts, rates, drop_at, ...(tag ? { tag } : {}) };
 }
-export async function compare(slug, pivot, event, daysBefore, daysAfter, tag) {
+export async function compare(workspaceId, slug, pivot, event, daysBefore, daysAfter, tag) {
     const pivotTs = new Date(pivot).getTime();
     const t = tag ?? null;
     const getStats = async (from, to) => {
         const [base] = await sql `
       SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS events
-      FROM events WHERE slug = ${slug} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
+      FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
     `;
         const sessions = Number(base.sessions ?? 0);
         const events = Number(base.events ?? 0);
         if (event) {
             const [comp] = await sql `
         SELECT COUNT(DISTINCT session_id) AS completions
-        FROM events WHERE slug = ${slug} AND event_name = ${event} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
+        FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${event} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
       `;
             return { sessions, events, completions: Number(comp.completions ?? 0) };
         }
@@ -178,17 +194,17 @@ export async function compare(slug, pivot, event, daysBefore, daysAfter, tag) {
         ...(tag ? { tag } : {}),
     };
 }
-export async function friction(slug, days, tag) {
+export async function friction(workspaceId, slug, days, tag) {
     const since = Date.now() - days * 86_400_000;
     const t = tag ?? null;
     const [totalRow] = await sql `
     SELECT COUNT(DISTINCT session_id) AS n FROM events
-    WHERE slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
   `;
     const total = Number(totalRow.n ?? 0);
     const ordered = await sql `
     SELECT event_name, COUNT(DISTINCT session_id) AS reached, AVG(ts) AS avg_ts
-    FROM events WHERE slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
     GROUP BY event_name ORDER BY avg_ts ASC
   `;
     const drops = ordered.map((e, i) => {
@@ -204,11 +220,11 @@ export async function friction(slug, days, tag) {
     });
     return { slug, total_sessions: total, drop_events: drops, ...(tag ? { tag } : {}) };
 }
-export async function journey(slug, entity_id, days) {
+export async function journey(workspaceId, slug, entity_id, days) {
     const since = Date.now() - days * 86_400_000;
     const rows = await sql `
     SELECT ts, event_name, session_id, properties, tag
-    FROM events WHERE slug = ${slug} AND entity_id = ${entity_id} AND ts >= ${since}
+    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND entity_id = ${entity_id} AND ts >= ${since}
     ORDER BY ts ASC
   `;
     const events = rows.map(r => ({
@@ -223,30 +239,31 @@ export async function journey(slug, entity_id, days) {
 // =============================================================================
 // SNIPPETS
 // =============================================================================
-export async function registerSnippet(url, slug) {
+export async function registerSnippet(workspaceId, url, slug) {
     const normalized = normalizeUrl(url);
     const now = Date.now();
     await sql `
-    INSERT INTO snippets (url, slug, created_at) VALUES (${normalized}, ${slug}, ${now})
-    ON CONFLICT(url) DO UPDATE SET slug = EXCLUDED.slug
+    INSERT INTO snippets (workspace_id, url, slug, created_at) VALUES (${workspaceId}, ${normalized}, ${slug}, ${now})
+    ON CONFLICT(workspace_id, url) DO UPDATE SET slug = EXCLUDED.slug
   `;
-    return { url: normalized, slug, created_at: now };
+    return { workspace_id: workspaceId, url: normalized, slug, created_at: now };
 }
-export async function resolveUrl(url) {
+export async function resolveUrl(workspaceId, url) {
     const normalized = normalizeUrl(url);
-    const [row] = await sql `SELECT url, slug, created_at FROM snippets WHERE url = ${normalized}`;
+    const [row] = await sql `SELECT workspace_id, url, slug, created_at FROM snippets WHERE workspace_id = ${workspaceId} AND url = ${normalized}`;
     if (!row)
         return null;
-    return { url: row.url, slug: row.slug, created_at: Number(row.created_at) };
+    return { workspace_id: row.workspace_id, url: row.url, slug: row.slug, created_at: Number(row.created_at) };
 }
-export async function listSnippets() {
-    const rows = await sql `SELECT url, slug, created_at FROM snippets ORDER BY created_at DESC`;
-    return rows.map(r => ({ url: r.url, slug: r.slug, created_at: Number(r.created_at) }));
+export async function listSnippets(workspaceId) {
+    const rows = await sql `SELECT workspace_id, url, slug, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
+    return rows.map(r => ({ workspace_id: r.workspace_id, url: r.url, slug: r.slug, created_at: Number(r.created_at) }));
 }
-export async function recentEvents(limit = 50) {
+export async function recentEvents(workspaceId, limit = 50) {
     const rows = await sql `
     SELECT ts, event_name, session_id, slug, tag
-    FROM events ORDER BY ts DESC LIMIT ${limit}
+    FROM events WHERE workspace_id = ${workspaceId}
+    ORDER BY ts DESC LIMIT ${limit}
   `;
     return rows.map(r => ({
         ts: Number(r.ts),

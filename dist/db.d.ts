@@ -58,6 +58,7 @@ export interface FrictionResult {
 export interface SnippetRow {
     url: string;
     slug: string;
+    workspace_id: string;
     created_at: number;
 }
 export interface JourneyEvent {
@@ -73,6 +74,13 @@ export interface JourneyResult {
     total_events: number;
     events: JourneyEvent[];
 }
+export interface RecentEvent {
+    ts: number;
+    event_name: string;
+    session_id: string;
+    slug: string;
+    tag: string | null;
+}
 export declare const LIMITS: {
     slug_max: number;
     event_name_max: number;
@@ -82,25 +90,18 @@ export declare const LIMITS: {
     property_string_max: number;
 };
 export declare function migrate(): Promise<void>;
-export declare function insertEvent(slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number): Promise<void>;
-export declare function purge(slug: string): Promise<{
+export declare function insertEvent(workspaceId: string, slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number): Promise<void>;
+export declare function purge(workspaceId: string, slug: string): Promise<{
     deleted: number;
 }>;
-export declare function listSlugs(): Promise<EventRow[]>;
-export declare function summary(slug: string, days: number, tag?: string): Promise<SummaryResult>;
-export declare function funnel(slug: string, steps: string[], days: number, tag?: string): Promise<FunnelResult>;
-export declare function compare(slug: string, pivot: string, event: string | null, daysBefore: number, daysAfter: number, tag?: string): Promise<CompareResult>;
-export declare function friction(slug: string, days: number, tag?: string): Promise<FrictionResult>;
-export declare function journey(slug: string, entity_id: string, days: number): Promise<JourneyResult>;
-export declare function registerSnippet(url: string, slug: string): Promise<SnippetRow>;
-export declare function resolveUrl(url: string): Promise<SnippetRow | null>;
-export declare function listSnippets(): Promise<SnippetRow[]>;
-export interface RecentEvent {
-    ts: number;
-    event_name: string;
-    session_id: string;
-    slug: string;
-    tag: string | null;
-}
-export declare function recentEvents(limit?: number): Promise<RecentEvent[]>;
+export declare function listSlugs(workspaceId: string): Promise<EventRow[]>;
+export declare function summary(workspaceId: string, slug: string, days: number, tag?: string): Promise<SummaryResult>;
+export declare function funnel(workspaceId: string, slug: string, steps: string[], days: number, tag?: string): Promise<FunnelResult>;
+export declare function compare(workspaceId: string, slug: string, pivot: string, event: string | null, daysBefore: number, daysAfter: number, tag?: string): Promise<CompareResult>;
+export declare function friction(workspaceId: string, slug: string, days: number, tag?: string): Promise<FrictionResult>;
+export declare function journey(workspaceId: string, slug: string, entity_id: string, days: number): Promise<JourneyResult>;
+export declare function registerSnippet(workspaceId: string, url: string, slug: string): Promise<SnippetRow>;
+export declare function resolveUrl(workspaceId: string, url: string): Promise<SnippetRow | null>;
+export declare function listSnippets(workspaceId: string): Promise<SnippetRow[]>;
+export declare function recentEvents(workspaceId: string, limit?: number): Promise<RecentEvent[]>;
 //# sourceMappingURL=db.d.ts.map

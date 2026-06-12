@@ -22,17 +22,19 @@ import {
 
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
+// Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
+const MCP_WORKSPACE_ID = process.env.MARK_WORKSPACE_ID ?? "local";
 
 // --- HTTP tracker script ---
 
-function trackerScript(slug: string): string {
+function trackerScript(slug: string, wid: string): string {
   return `(function(){
   var k='_mark_sid';
   var sid=sessionStorage.getItem(k)||(Math.random().toString(36).slice(2)+Date.now().toString(36));
   sessionStorage.setItem(k,sid);
   var _eid=null,_tag=null;
   function send(evt,props){
-    var payload={slug:'${slug}',session_id:sid,event_name:evt,properties:props||{}};
+    var payload={workspace_id:'${wid}',slug:'${slug}',session_id:sid,event_name:evt,properties:props||{}};
     if(_eid) payload.entity_id=_eid;
     if(_tag) payload.tag=_tag;
     fetch('${PUBLIC_URL}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
@@ -65,8 +67,8 @@ function trackerScript(slug: string): string {
 })();`;
 }
 
-function htmlSnippet(slug: string): string {
-  return `<script src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}"></script>`;
+function htmlSnippet(slug: string, wid: string): string {
+  return `<script src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
 }
 
 // --- HTTP server ---
@@ -93,23 +95,26 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
 
   if (req.method === "GET" && url.pathname === "/mark.js") {
     const slug = url.searchParams.get("slug") ?? "default";
+    const wid = url.searchParams.get("wid") ?? "";
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
     res.writeHead(200);
-    res.end(trackerScript(slug));
+    res.end(trackerScript(slug, wid));
     return;
   }
 
-  // --- Query endpoints ---
+  // --- Query endpoints (workspace_id from x-workspace-id header) ---
+
+  const wid = (req.headers["x-workspace-id"] as string | undefined) ?? "";
 
   if (req.method === "GET" && url.pathname === "/q/list") {
-    json(res, await listSlugs());
+    json(res, await listSlugs(wid));
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/logs/recent") {
     const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 200);
-    json(res, await recentEvents(limit));
+    json(res, await recentEvents(wid, limit));
     return;
   }
 
@@ -118,7 +123,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     const slug = decodeURIComponent(summaryMatch[1]);
     const days = parseInt(url.searchParams.get("days") ?? "7", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
-    json(res, await summary(slug, isNaN(days) ? 7 : days, tag));
+    json(res, await summary(wid, slug, isNaN(days) ? 7 : days, tag));
     return;
   }
 
@@ -133,7 +138,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       json(res, { error: "steps param requires at least 2 comma-separated event names" }, 400);
       return;
     }
-    json(res, await funnel(slug, steps, isNaN(days) ? 30 : days, tag));
+    json(res, await funnel(wid, slug, steps, isNaN(days) ? 30 : days, tag));
     return;
   }
 
@@ -149,7 +154,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     const daysBefore = parseInt(url.searchParams.get("days_before") ?? "14", 10);
     const daysAfter = parseInt(url.searchParams.get("days_after") ?? "14", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
-    json(res, await compare(slug, pivot, event, isNaN(daysBefore) ? 14 : daysBefore, isNaN(daysAfter) ? 14 : daysAfter, tag));
+    json(res, await compare(wid, slug, pivot, event, isNaN(daysBefore) ? 14 : daysBefore, isNaN(daysAfter) ? 14 : daysAfter, tag));
     return;
   }
 
@@ -158,7 +163,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     const slug = decodeURIComponent(frictionMatch[1]);
     const days = parseInt(url.searchParams.get("days") ?? "30", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
-    json(res, await friction(slug, isNaN(days) ? 30 : days, tag));
+    json(res, await friction(wid, slug, isNaN(days) ? 30 : days, tag));
     return;
   }
 
@@ -171,7 +176,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       return;
     }
     const days = parseInt(url.searchParams.get("days") ?? "30", 10);
-    json(res, await journey(slug, entity_id, isNaN(days) ? 30 : days));
+    json(res, await journey(wid, slug, entity_id, isNaN(days) ? 30 : days));
     return;
   }
 
@@ -207,16 +212,16 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     });
     try {
       const parsed = JSON.parse(body) as {
-        slug?: string; session_id?: string; event_name?: string;
+        workspace_id?: string; slug?: string; session_id?: string; event_name?: string;
         properties?: Record<string, unknown>;
         tag?: string; entity_id?: string; ts?: number;
       };
-      const { slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
-      if (!slug || !session_id || !event_name) {
-        json(res, { error: "Missing required fields: slug, session_id, event_name" }, 400);
+      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
+      if (!workspace_id || !slug || !session_id || !event_name) {
+        json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
         return;
       }
-      await insertEvent(slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
+      await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
       json(res, { ok: true });
     } catch {
       json(res, { error: "Invalid JSON" }, 400);
@@ -298,7 +303,7 @@ Returns: { snippet, ingestion_url, usage, registered? }`,
     },
     async ({ slug, url }) => {
       const result: Record<string, unknown> = {
-        snippet: htmlSnippet(slug),
+        snippet: htmlSnippet(slug, MCP_WORKSPACE_ID),
         ingestion_url: `${PUBLIC_URL}/e`,
         usage: {
           track: `markjs.track('event_name', { optional: 'props' })`,
@@ -307,7 +312,7 @@ Returns: { snippet, ingestion_url, usage, registered? }`,
         },
       };
       if (url) {
-        const reg = await registerSnippet(url, slug);
+        const reg = await registerSnippet(MCP_WORKSPACE_ID, url, slug);
         result.registered = reg;
       }
       return ok(result);
@@ -334,7 +339,7 @@ Complement with mark_list_snippets to see all registered URLs.`,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ url }) => {
-      const row = await resolveUrl(url);
+      const row = await resolveUrl(MCP_WORKSPACE_ID, url);
       return ok(row ?? { found: false, url });
     }
   );
@@ -351,7 +356,7 @@ Use when: you want to see which sites have been instrumented and which slug each
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => ok(await listSnippets())
+    async () => ok(await listSnippets(MCP_WORKSPACE_ID))
   );
 
   server.registerTool(
@@ -383,7 +388,7 @@ Returns: { ok: true, slug, event_name }`,
     },
     async ({ slug, session_id, event_name, properties, tag, entity_id, ts }) => {
       try {
-        await insertEvent(slug, session_id, event_name, (properties ?? {}) as Record<string, unknown>, tag, entity_id, ts);
+        await insertEvent(MCP_WORKSPACE_ID, slug, session_id, event_name, (properties ?? {}) as Record<string, unknown>, tag, entity_id, ts);
         return ok({ ok: true, slug, event_name });
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
@@ -403,7 +408,7 @@ Use when: you want to see what apps are currently being tracked before deeper an
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => ok(await listSlugs())
+    async () => ok(await listSlugs(MCP_WORKSPACE_ID))
   );
 
   server.registerTool(
@@ -427,7 +432,7 @@ Use when: you want a quick health check. Call mark_friction or mark_funnel for d
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, days, tag }) => ok(await summary(slug, days ?? 7, tag))
+    async ({ slug, days, tag }) => ok(await summary(MCP_WORKSPACE_ID, slug, days ?? 7, tag))
   );
 
   server.registerTool(
@@ -457,7 +462,7 @@ Examples:
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, steps, days, tag }) => ok(await funnel(slug, steps, days ?? 30, tag))
+    async ({ slug, steps, days, tag }) => ok(await funnel(MCP_WORKSPACE_ID, slug, steps, days ?? 30, tag))
   );
 
   server.registerTool(
@@ -492,7 +497,7 @@ Use when: you shipped a redesign, copy change, or fix and want to measure the be
       if (isNaN(new Date(pivot).getTime())) {
         return err(`Invalid pivot date "${pivot}". Use ISO format e.g. "2026-06-01".`);
       }
-      return ok(await compare(slug, pivot, event ?? null, days_before ?? 14, days_after ?? 14, tag));
+      return ok(await compare(MCP_WORKSPACE_ID, slug, pivot, event ?? null, days_before ?? 14, days_after ?? 14, tag));
     }
   );
 
@@ -519,7 +524,7 @@ Then use mark_funnel to zoom in on the suspect step.`,
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, days, tag }) => ok(await friction(slug, days ?? 30, tag))
+    async ({ slug, days, tag }) => ok(await friction(MCP_WORKSPACE_ID, slug, days ?? 30, tag))
   );
 
   server.registerTool(
@@ -550,7 +555,7 @@ Use when: you want to replay or debug a specific user's path. Complement with ma
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, entity_id, days }) => ok(await journey(slug, entity_id, days ?? 30))
+    async ({ slug, entity_id, days }) => ok(await journey(MCP_WORKSPACE_ID, slug, entity_id, days ?? 30))
   );
 
   server.registerTool(
@@ -572,7 +577,7 @@ WARNING: Always confirm with the user before calling this. Data cannot be recove
     },
     async ({ slug }) => {
       try {
-        return ok(await purge(slug));
+        return ok(await purge(MCP_WORKSPACE_ID, slug));
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
       }

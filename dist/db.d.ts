@@ -1,3 +1,6 @@
+import postgres from "postgres";
+declare const sql: postgres.Sql<{}>;
+export { sql };
 export interface EventRow {
     slug: string;
     sessions: number;

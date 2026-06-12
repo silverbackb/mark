@@ -264,7 +264,7 @@ async function main(): Promise<void> {
   migrate();
   startHttpServer();
 
-  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.3" });
+  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.6" });
 
   server.registerTool(
     "mark_snippet",

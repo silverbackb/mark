@@ -1,4 +1,4 @@
-# @silverbackbase/mark
+# @silverbackbase/mark · v0.1.8
 
 Headless micro-analytics for AI agents. A one-line snippet on your site, and your agent reads visitor behavior directly — no dashboard, no UI.
 

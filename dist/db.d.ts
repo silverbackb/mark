@@ -1,4 +1,3 @@
-export declare function migrate(): void;
 export interface EventRow {
     slug: string;
     sessions: number;
@@ -79,17 +78,18 @@ export declare const LIMITS: {
     properties_max_keys: number;
     property_string_max: number;
 };
-export declare function insertEvent(slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number): void;
-export declare function purge(slug: string): {
+export declare function migrate(): Promise<void>;
+export declare function insertEvent(slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number): Promise<void>;
+export declare function purge(slug: string): Promise<{
     deleted: number;
-};
-export declare function listSlugs(): EventRow[];
-export declare function summary(slug: string, days: number, tag?: string): SummaryResult;
-export declare function funnel(slug: string, steps: string[], days: number, tag?: string): FunnelResult;
-export declare function compare(slug: string, pivot: string, event: string | null, daysBefore: number, daysAfter: number, tag?: string): CompareResult;
-export declare function friction(slug: string, days: number, tag?: string): FrictionResult;
-export declare function journey(slug: string, entity_id: string, days: number): JourneyResult;
-export declare function registerSnippet(url: string, slug: string): SnippetRow;
-export declare function resolveUrl(url: string): SnippetRow | null;
-export declare function listSnippets(): SnippetRow[];
+}>;
+export declare function listSlugs(): Promise<EventRow[]>;
+export declare function summary(slug: string, days: number, tag?: string): Promise<SummaryResult>;
+export declare function funnel(slug: string, steps: string[], days: number, tag?: string): Promise<FunnelResult>;
+export declare function compare(slug: string, pivot: string, event: string | null, daysBefore: number, daysAfter: number, tag?: string): Promise<CompareResult>;
+export declare function friction(slug: string, days: number, tag?: string): Promise<FrictionResult>;
+export declare function journey(slug: string, entity_id: string, days: number): Promise<JourneyResult>;
+export declare function registerSnippet(url: string, slug: string): Promise<SnippetRow>;
+export declare function resolveUrl(url: string): Promise<SnippetRow | null>;
+export declare function listSnippets(): Promise<SnippetRow[]>;
 //# sourceMappingURL=db.d.ts.map

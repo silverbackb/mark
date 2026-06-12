@@ -1,3 +1,13 @@
+## v0.1.7 — 2026-06-12
+
+### Ajouté
+- Support Railway : écoute sur `PORT` env var (Railway) avec `MARK_PORT` en fallback
+- `MARK_PUBLIC_URL` : URL publique injectée dans le snippet et les réponses `mark_snippet` (pour deploy distant)
+- `MARK_DB_PATH` : chemin SQLite configurable (pour volumes Railway)
+- Binding sur `::` (IPv6) pour compatibilité Railway
+
+---
+
 ## v0.1.6 — 2026-06-12
 
 ### Corrigé

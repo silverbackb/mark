@@ -19,7 +19,8 @@ import {
   LIMITS,
 } from "./db.js";
 
-const PORT = parseInt(process.env.MARK_PORT ?? "7331", 10);
+const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
+const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 
 // --- HTTP tracker script ---
 
@@ -33,7 +34,7 @@ function trackerScript(slug: string): string {
     var payload={slug:'${slug}',session_id:sid,event_name:evt,properties:props||{}};
     if(_eid) payload.entity_id=_eid;
     if(_tag) payload.tag=_tag;
-    fetch('http://localhost:${PORT}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
+    fetch('${PUBLIC_URL}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
   }
   window.markjs={
     identify:function(id){ _eid=id||null; },
@@ -64,7 +65,7 @@ function trackerScript(slug: string): string {
 }
 
 function htmlSnippet(slug: string): string {
-  return `<script src="http://localhost:${PORT}/mark.js?slug=${encodeURIComponent(slug)}"></script>`;
+  return `<script src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}"></script>`;
 }
 
 // --- HTTP server ---
@@ -218,10 +219,16 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
           res.end(JSON.stringify({ error: "Missing required fields: slug, session_id, event_name" }));
           return;
         }
-        insertEvent(slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
-        res.setHeader("Content-Type", "application/json");
-        res.writeHead(200);
-        res.end(JSON.stringify({ ok: true }));
+        insertEvent(slug, session_id, event_name, properties ?? {}, tag, entity_id, ts)
+          .then(() => {
+            res.setHeader("Content-Type", "application/json");
+            res.writeHead(200);
+            res.end(JSON.stringify({ ok: true }));
+          })
+          .catch((e: unknown) => {
+            res.writeHead(500);
+            res.end(JSON.stringify({ error: e instanceof Error ? e.message : "internal error" }));
+          });
       } catch {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "Invalid JSON" }));
@@ -236,8 +243,8 @@ function handleRequest(req: IncomingMessage, res: ServerResponse): void {
 
 function startHttpServer(): void {
   const server = createServer(handleRequest);
-  server.listen(PORT, () => {
-    process.stderr.write(`[mark] HTTP ingestion server on http://localhost:${PORT}\n`);
+  server.listen(PORT, "::", () => {
+    process.stderr.write(`[mark] HTTP server on port ${PORT} (public: ${PUBLIC_URL})\n`);
   });
   server.on("error", (err: NodeJS.ErrnoException) => {
     if (err.code === "EADDRINUSE") {
@@ -261,10 +268,10 @@ function err(message: string): { isError: true; content: [{ type: "text"; text: 
 // --- MCP server ---
 
 async function main(): Promise<void> {
-  migrate();
+  await migrate();
   startHttpServer();
 
-  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.6" });
+  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.7" });
 
   server.registerTool(
     "mark_snippet",
@@ -296,7 +303,7 @@ Returns: { snippet, ingestion_url, usage, registered? }`,
     async ({ slug, url }) => {
       const result: Record<string, unknown> = {
         snippet: htmlSnippet(slug),
-        ingestion_url: `http://localhost:${PORT}/e`,
+        ingestion_url: `${PUBLIC_URL}/e`,
         usage: {
           track: `markjs.track('event_name', { optional: 'props' })`,
           identify: `markjs.identify('user-123') — link events to an entity`,
@@ -304,7 +311,7 @@ Returns: { snippet, ingestion_url, usage, registered? }`,
         },
       };
       if (url) {
-        const reg = registerSnippet(url, slug);
+        const reg = await registerSnippet(url, slug);
         result.registered = reg;
       }
       return ok(result);
@@ -331,7 +338,7 @@ Complement with mark_list_snippets to see all registered URLs.`,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ url }) => {
-      const row = resolveUrl(url);
+      const row = await resolveUrl(url);
       return ok(row ?? { found: false, url });
     }
   );
@@ -348,7 +355,7 @@ Use when: you want to see which sites have been instrumented and which slug each
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => ok(listSnippets())
+    async () => ok(await listSnippets())
   );
 
   server.registerTool(
@@ -380,7 +387,7 @@ Returns: { ok: true, slug, event_name }`,
     },
     async ({ slug, session_id, event_name, properties, tag, entity_id, ts }) => {
       try {
-        insertEvent(slug, session_id, event_name, (properties ?? {}) as Record<string, unknown>, tag, entity_id, ts);
+        await insertEvent(slug, session_id, event_name, (properties ?? {}) as Record<string, unknown>, tag, entity_id, ts);
         return ok({ ok: true, slug, event_name });
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
@@ -400,7 +407,7 @@ Use when: you want to see what apps are currently being tracked before deeper an
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => ok(listSlugs())
+    async () => ok(await listSlugs())
   );
 
   server.registerTool(
@@ -424,7 +431,7 @@ Use when: you want a quick health check. Call mark_friction or mark_funnel for d
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, days, tag }) => ok(summary(slug, days ?? 7, tag))
+    async ({ slug, days, tag }) => ok(await summary(slug, days ?? 7, tag))
   );
 
   server.registerTool(
@@ -454,7 +461,7 @@ Examples:
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, steps, days, tag }) => ok(funnel(slug, steps, days ?? 30, tag))
+    async ({ slug, steps, days, tag }) => ok(await funnel(slug, steps, days ?? 30, tag))
   );
 
   server.registerTool(
@@ -489,7 +496,7 @@ Use when: you shipped a redesign, copy change, or fix and want to measure the be
       if (isNaN(new Date(pivot).getTime())) {
         return err(`Invalid pivot date "${pivot}". Use ISO format e.g. "2026-06-01".`);
       }
-      return ok(compare(slug, pivot, event ?? null, days_before ?? 14, days_after ?? 14, tag));
+      return ok(await compare(slug, pivot, event ?? null, days_before ?? 14, days_after ?? 14, tag));
     }
   );
 
@@ -516,7 +523,7 @@ Then use mark_funnel to zoom in on the suspect step.`,
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, days, tag }) => ok(friction(slug, days ?? 30, tag))
+    async ({ slug, days, tag }) => ok(await friction(slug, days ?? 30, tag))
   );
 
   server.registerTool(
@@ -547,7 +554,7 @@ Use when: you want to replay or debug a specific user's path. Complement with ma
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, entity_id, days }) => ok(journey(slug, entity_id, days ?? 30))
+    async ({ slug, entity_id, days }) => ok(await journey(slug, entity_id, days ?? 30))
   );
 
   server.registerTool(
@@ -569,7 +576,7 @@ WARNING: Always confirm with the user before calling this. Data cannot be recove
     },
     async ({ slug }) => {
       try {
-        return ok(purge(slug));
+        return ok(await purge(slug));
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
       }

@@ -104,6 +104,12 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
   }
 
   // --- Query endpoints (workspace_id from x-workspace-id header) ---
+  // Require x-internal-secret when configured (open in self-hosted mode)
+  const internalSecret = process.env.MARK_INTERNAL_SECRET ?? "";
+  if (internalSecret && req.headers["x-internal-secret"] !== internalSecret) {
+    json(res, { error: "Unauthorized" }, 401);
+    return;
+  }
 
   const wid = (req.headers["x-workspace-id"] as string | undefined) ?? "";
 

@@ -1,3 +1,5 @@
+import Database from "better-sqlite3";
+import postgres from "postgres";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +10,10 @@ import { join } from "node:path";
 const USE_PG = !!process.env.DATABASE_URL;
 
 // --- SQLite setup ---
-let _sqliteDb: import("better-sqlite3").Database | null = null;
+let _sqliteDb: Database.Database | null = null;
 
-function getDb(): import("better-sqlite3").Database {
+function getDb(): Database.Database {
   if (!_sqliteDb) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const Database = require("better-sqlite3") as typeof import("better-sqlite3");
     const dir = process.env.MARK_DB_PATH ?? join(homedir(), ".mark");
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     _sqliteDb = new Database(join(dir, "mark.db"));
@@ -23,14 +23,10 @@ function getDb(): import("better-sqlite3").Database {
 }
 
 // --- PostgreSQL setup ---
-let _sql: import("postgres").Sql | null = null;
+let _sql: postgres.Sql | null = null;
 
-function getSql(): import("postgres").Sql {
-  if (!_sql) {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const postgres = require("postgres") as typeof import("postgres");
-    _sql = postgres(process.env.DATABASE_URL!, { max: 10 });
-  }
+function getSql(): postgres.Sql {
+  if (!_sql) _sql = postgres(process.env.DATABASE_URL!, { max: 10 });
   return _sql;
 }
 

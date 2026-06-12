@@ -1,3 +1,5 @@
+import Database from "better-sqlite3";
+import postgres from "postgres";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -8,8 +10,6 @@ const USE_PG = !!process.env.DATABASE_URL;
 let _sqliteDb = null;
 function getDb() {
     if (!_sqliteDb) {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const Database = require("better-sqlite3");
         const dir = process.env.MARK_DB_PATH ?? join(homedir(), ".mark");
         if (!existsSync(dir))
             mkdirSync(dir, { recursive: true });
@@ -21,11 +21,8 @@ function getDb() {
 // --- PostgreSQL setup ---
 let _sql = null;
 function getSql() {
-    if (!_sql) {
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const postgres = require("postgres");
+    if (!_sql)
         _sql = postgres(process.env.DATABASE_URL, { max: 10 });
-    }
     return _sql;
 }
 export const LIMITS = {

@@ -81,6 +81,20 @@ function htmlSnippet(slug: string, wid: string): string {
   return `<script async src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
 }
 
+// GTM-compatible snippet: a bare <script src> inside a Custom HTML tag does not
+// execute reliably. GTM runs inline JS reliably, so we inject the script via DOM.
+function gtmSnippet(slug: string, wid: string): string {
+  const src = `${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}`;
+  return `<script>
+  (function(){
+    var s=document.createElement('script');
+    s.async=true;
+    s.src=${JSON.stringify(src)};
+    document.head.appendChild(s);
+  })();
+</script>`;
+}
+
 // --- HTTP server ---
 
 function json(res: ServerResponse, data: unknown, status = 200): void {
@@ -310,7 +324,7 @@ async function main(): Promise<void> {
   await migrate();
   startHttpServer();
 
-  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.7" });
+  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.12" });
 
   server.registerTool(
     "mark_snippet",
@@ -332,7 +346,9 @@ Args:
   - slug (string): Unique identifier for your app or page (e.g. "onboarding", "game-v2")
   - url (string, optional): URL of the site or page being instrumented — registers the URL→slug mapping for future lookup
 
-Returns: { snippet, ingestion_url, usage, registered? }`,
+Returns: { snippet, snippet_gtm, ingestion_url, usage, registered? }
+  - snippet: standard <script> for direct insertion before </body>
+  - snippet_gtm: GTM-compatible version (dynamic injection) for a Custom HTML tag`,
       inputSchema: z.object({
         slug: z.string().min(1).max(100).describe("Unique identifier for the app or page to track"),
         url: z.string().url().optional().describe("URL of the site being instrumented — registers the URL→slug mapping"),
@@ -342,6 +358,7 @@ Returns: { snippet, ingestion_url, usage, registered? }`,
     async ({ slug, url }) => {
       const result: Record<string, unknown> = {
         snippet: htmlSnippet(slug, MCP_WORKSPACE_ID),
+        snippet_gtm: gtmSnippet(slug, MCP_WORKSPACE_ID),
         ingestion_url: `${PUBLIC_URL}/e`,
         usage: {
           track: `markjs.track('event_name', { optional: 'props' })`,

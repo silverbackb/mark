@@ -1,6 +1,6 @@
 {
   "name": "@silverbackbase/mark",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "Headless micro-analytics for AI agents — track user behavior without a dashboard",
   "type": "module",
   "main": "dist/index.js",

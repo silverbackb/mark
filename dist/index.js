@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "node:http";
@@ -41,6 +40,17 @@ function trackerScript(slug, wid) {
     var form=e.target;
     send('form_submit',{id:form.id||undefined,action:form.action||undefined});
   });
+  // scroll depth (25/50/75/100)
+  var _scrollFired={};
+  window.addEventListener('scroll',function(){
+    var el=document.documentElement;
+    var scrollable=el.scrollHeight-el.clientHeight;
+    if(scrollable<=0) return;
+    var pct=Math.round(window.scrollY/scrollable*100);
+    [25,50,75,100].forEach(function(t){
+      if(pct>=t&&!_scrollFired[t]){_scrollFired[t]=true;send('scroll_depth',{percent:t});}
+    });
+  },{passive:true});
   // time on page
   var _start=Date.now();
   window.addEventListener('beforeunload',function(){
@@ -49,7 +59,7 @@ function trackerScript(slug, wid) {
 })();`;
 }
 function htmlSnippet(slug, wid) {
-    return `<script src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
+    return `<script async src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
 }
 // --- HTTP server ---
 function json(res, data, status = 200) {
@@ -78,6 +88,52 @@ async function handleRequestAsync(req, res) {
         res.setHeader("Cache-Control", "no-store");
         res.writeHead(200);
         res.end(trackerScript(slug, wid));
+        return;
+    }
+    // --- Ingestion (public — no secret required, workspace_id in body) ---
+    if (req.method === "POST" && url.pathname === "/e") {
+        const body = await new Promise((resolve, reject) => {
+            let data = "";
+            req.on("data", (chunk) => { data += chunk.toString(); });
+            req.on("end", () => resolve(data));
+            req.on("error", reject);
+        });
+        try {
+            const parsed = JSON.parse(body);
+            const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
+            if (!workspace_id || !slug || !session_id || !event_name) {
+                json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
+                return;
+            }
+            // Fire billing callback if configured
+            const eventDebitUrl = process.env.SILVERBACKBASE_EVENT_DEBIT_URL;
+            const eventDebitSecret = process.env.SILVERBACKBASE_EVENT_DEBIT_SECRET;
+            if (eventDebitUrl && eventDebitSecret && workspace_id !== "local") {
+                try {
+                    const billRes = await fetch(eventDebitUrl, {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "x-internal-event-secret": eventDebitSecret,
+                        },
+                        body: JSON.stringify({ workspace_id, event_name }),
+                    });
+                    if (billRes.status === 402) {
+                        json(res, { error: "Insufficient balance" }, 402);
+                        return;
+                    }
+                    // 401 or other errors → still accept event (don't block tracking on billing misconfiguration)
+                }
+                catch {
+                    // Network error → accept event anyway (don't break tracking)
+                }
+            }
+            await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
+            json(res, { ok: true });
+        }
+        catch {
+            json(res, { error: "Invalid JSON" }, 400);
+        }
         return;
     }
     // --- Query endpoints (workspace_id from x-workspace-id header) ---
@@ -172,29 +228,6 @@ async function handleRequestAsync(req, res) {
                 { method: "GET", path: "/q/journey/:slug", params: { entity_id: "string (required)", days: "number (default 30)" }, description: "All events for a specific entity" },
             ],
         });
-        return;
-    }
-    // --- Ingestion ---
-    if (req.method === "POST" && url.pathname === "/e") {
-        const body = await new Promise((resolve, reject) => {
-            let data = "";
-            req.on("data", (chunk) => { data += chunk.toString(); });
-            req.on("end", () => resolve(data));
-            req.on("error", reject);
-        });
-        try {
-            const parsed = JSON.parse(body);
-            const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
-            if (!workspace_id || !slug || !session_id || !event_name) {
-                json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
-                return;
-            }
-            await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
-            json(res, { ok: true });
-        }
-        catch {
-            json(res, { error: "Invalid JSON" }, 400);
-        }
         return;
     }
     res.writeHead(404);

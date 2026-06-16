@@ -113,6 +113,56 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     return;
   }
 
+  // --- Ingestion (public — no secret required, workspace_id in body) ---
+
+  if (req.method === "POST" && url.pathname === "/e") {
+    const body = await new Promise<string>((resolve, reject) => {
+      let data = "";
+      req.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      req.on("end", () => resolve(data));
+      req.on("error", reject);
+    });
+    try {
+      const parsed = JSON.parse(body) as {
+        workspace_id?: string; slug?: string; session_id?: string; event_name?: string;
+        properties?: Record<string, unknown>;
+        tag?: string; entity_id?: string; ts?: number;
+      };
+      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
+      if (!workspace_id || !slug || !session_id || !event_name) {
+        json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
+        return;
+      }
+      // Fire billing callback if configured
+      const eventDebitUrl = process.env.SILVERBACKBASE_EVENT_DEBIT_URL;
+      const eventDebitSecret = process.env.SILVERBACKBASE_EVENT_DEBIT_SECRET;
+      if (eventDebitUrl && eventDebitSecret && workspace_id !== "local") {
+        try {
+          const billRes = await fetch(eventDebitUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-internal-event-secret": eventDebitSecret,
+            },
+            body: JSON.stringify({ workspace_id, event_name }),
+          });
+          if (billRes.status === 402) {
+            json(res, { error: "Insufficient balance" }, 402);
+            return;
+          }
+          // 401 or other errors → still accept event (don't block tracking on billing misconfiguration)
+        } catch {
+          // Network error → accept event anyway (don't break tracking)
+        }
+      }
+      await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
+      json(res, { ok: true });
+    } catch {
+      json(res, { error: "Invalid JSON" }, 400);
+    }
+    return;
+  }
+
   // --- Query endpoints (workspace_id from x-workspace-id header) ---
   // Require x-internal-secret when configured (open in self-hosted mode)
   const internalSecret = process.env.MARK_INTERNAL_SECRET ?? "";
@@ -214,56 +264,6 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
         { method: "GET", path: "/q/journey/:slug", params: { entity_id: "string (required)", days: "number (default 30)" }, description: "All events for a specific entity" },
       ],
     });
-    return;
-  }
-
-  // --- Ingestion ---
-
-  if (req.method === "POST" && url.pathname === "/e") {
-    const body = await new Promise<string>((resolve, reject) => {
-      let data = "";
-      req.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-      req.on("end", () => resolve(data));
-      req.on("error", reject);
-    });
-    try {
-      const parsed = JSON.parse(body) as {
-        workspace_id?: string; slug?: string; session_id?: string; event_name?: string;
-        properties?: Record<string, unknown>;
-        tag?: string; entity_id?: string; ts?: number;
-      };
-      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
-      if (!workspace_id || !slug || !session_id || !event_name) {
-        json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
-        return;
-      }
-      // Fire billing callback if configured
-      const eventDebitUrl = process.env.SILVERBACKBASE_EVENT_DEBIT_URL;
-      const eventDebitSecret = process.env.SILVERBACKBASE_EVENT_DEBIT_SECRET;
-      if (eventDebitUrl && eventDebitSecret && workspace_id !== "local") {
-        try {
-          const billRes = await fetch(eventDebitUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-internal-event-secret": eventDebitSecret,
-            },
-            body: JSON.stringify({ workspace_id, event_name }),
-          });
-          if (billRes.status === 402) {
-            json(res, { error: "Insufficient balance" }, 402);
-            return;
-          }
-          // 401 or other errors → still accept event (don't block tracking on billing misconfiguration)
-        } catch {
-          // Network error → accept event anyway (don't break tracking)
-        }
-      }
-      await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
-      json(res, { ok: true });
-    } catch {
-      json(res, { error: "Invalid JSON" }, 400);
-    }
     return;
   }
 

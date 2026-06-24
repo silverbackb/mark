@@ -1,4 +1,4 @@
-# @silverbackbase/mark · v0.1.8
+# @silverbackbase/mark · v0.1.13
 
 Headless micro-analytics for AI agents. A one-line snippet on your site, and your agent reads visitor behavior directly — no dashboard, no UI.
 
@@ -87,6 +87,7 @@ mark_compare("my-site", pivot="2026-06-01", event="form_submit")
 | `mark_compare` | Behavior before vs after a date pivot |
 | `mark_friction` | Where sessions stop progressing |
 | `mark_journey` | Full event history for a specific entity |
+| `mark_breakdown` | Group an event by a property value — e.g. `page_view` by `url` to see top pages |
 | `mark_purge` | Delete all data for a slug (irreversible) |
 
 ---
@@ -104,6 +105,7 @@ GET  /q/funnel/:slug?steps=a,b,c         Funnel conversion by step
 GET  /q/compare/:slug?pivot=ISO          Before vs after comparison
 GET  /q/friction/:slug                   Drop-off points
 GET  /q/journey/:slug?entity_id=ID       Entity event history
+GET  /q/breakdown/:slug?event=&property= Group event by property value
 GET  /q/schema                           Full endpoint schema
 ```
 

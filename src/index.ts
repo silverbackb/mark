@@ -11,6 +11,7 @@ import {
   compare,
   friction,
   journey,
+  breakdown,
   purge,
   registerSnippet,
   resolveUrl,
@@ -260,6 +261,22 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     return;
   }
 
+  const breakdownMatch = url.pathname.match(/^\/q\/breakdown\/(.+)$/);
+  if (req.method === "GET" && breakdownMatch) {
+    const slug = decodeURIComponent(breakdownMatch[1]);
+    const event_name = url.searchParams.get("event") ?? "";
+    const property = url.searchParams.get("property") ?? "";
+    if (!event_name || !property) {
+      json(res, { error: "event and property params required" }, 400);
+      return;
+    }
+    const days = parseInt(url.searchParams.get("days") ?? "30", 10);
+    const tag = url.searchParams.get("tag") ?? undefined;
+    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "30", 10) || 30, 100);
+    json(res, await breakdown(wid, slug, event_name, property, isNaN(days) ? 30 : days, tag, limit));
+    return;
+  }
+
   if (req.method === "GET" && url.pathname === "/q/schema") {
     json(res, {
       limits: LIMITS,
@@ -276,6 +293,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
         { method: "GET", path: "/q/compare/:slug", params: { pivot: "ISO date", event: "string?", days_before: "number (default 14)", days_after: "number (default 14)", tag: "string?" }, description: "Compare behavior before vs after a date" },
         { method: "GET", path: "/q/friction/:slug", params: { days: "number (default 30)", tag: "string?" }, description: "Drop-off points by event sequence" },
         { method: "GET", path: "/q/journey/:slug", params: { entity_id: "string (required)", days: "number (default 30)" }, description: "All events for a specific entity" },
+        { method: "GET", path: "/q/breakdown/:slug", params: { event: "string (required)", property: "string (required)", days: "number (default 30)", tag: "string?", limit: "number (default 30, max 100)" }, description: "Group an event by a property value — e.g. page_view by url" },
       ],
     });
     return;
@@ -324,7 +342,7 @@ async function main(): Promise<void> {
   await migrate();
   startHttpServer();
 
-  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.12" });
+  const server = new McpServer({ name: "mark-mcp-server", version: "0.1.13" });
 
   server.registerTool(
     "mark_snippet",
@@ -611,6 +629,56 @@ Use when: you want to replay or debug a specific user's path. Complement with ma
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, entity_id, days }) => ok(await journey(MCP_WORKSPACE_ID, slug, entity_id, days ?? 30))
+  );
+
+  server.registerTool(
+    "mark_breakdown",
+    {
+      title: "Breakdown Event by Property",
+      description: `Group an event by a property value and count sessions and occurrences per value.
+
+The primary use case is page-level analysis: call with event_name="page_view" and property="url"
+to see which pages were visited, how many sessions hit each one, and how many views they got.
+
+Works for any event/property combination:
+  - mark_breakdown("at2o", "page_view", "url")       → top pages by sessions
+  - mark_breakdown("at2o", "click", "label")          → top clicked button labels
+  - mark_breakdown("at2o", "form_submit", "id")       → which forms are submitted
+  - mark_breakdown("at2o", "scroll_depth", "percent") → scroll depth distribution
+
+Args:
+  - slug (string): App or page identifier
+  - event_name (string): Event to group (e.g. "page_view", "click")
+  - property (string): Property key to group by (e.g. "url", "label", "percent")
+  - days (number, optional): Lookback window in days (default 30)
+  - tag (string, optional): Filter to a specific segment (e.g. "ads", "seo")
+  - limit (number, optional): Max values to return (default 30, max 100)
+
+Returns:
+  {
+    "slug": string,
+    "event_name": string,
+    "property": string,
+    "period": string,
+    "total_sessions": number,
+    "breakdown": [{ "value": string|null, "sessions": number, "events": number }],
+    "tag"?: string
+  }
+
+Use when: you see a high event count in mark_summary and need to understand the distribution.
+Complement with mark_funnel to measure conversion from a specific page.`,
+      inputSchema: z.object({
+        slug: z.string().min(1).describe("App or page identifier"),
+        event_name: z.string().min(1).max(100).describe("Event name to group (e.g. \"page_view\", \"click\")"),
+        property: z.string().min(1).max(100).describe("Property key to group by (e.g. \"url\", \"label\", \"percent\")"),
+        days: z.number().int().min(1).max(365).optional().default(30).describe("Lookback window in days (default 30)"),
+        tag: z.string().max(100).optional().describe("Filter to a specific segment"),
+        limit: z.number().int().min(1).max(100).optional().default(30).describe("Max values to return (default 30, max 100)"),
+      }).strict(),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ slug, event_name, property, days, tag, limit }) =>
+      ok(await breakdown(MCP_WORKSPACE_ID, slug, event_name, property, days ?? 30, tag, limit ?? 30))
   );
 
   server.registerTool(

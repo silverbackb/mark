@@ -1,3 +1,30 @@
+## v0.1.13 — 2026-06-24
+
+### Ajouté
+- Outil MCP `mark_breakdown` : groupe un événement par valeur de propriété et renvoie sessions + occurrences par valeur. Exemple : `mark_breakdown("slug", "page_view", "url")` liste les pages les plus visitées avec leurs sessions.
+- Route HTTP `GET /q/breakdown/:slug?event=&property=&days=&tag=&limit=` correspondante.
+
+---
+
+## v0.1.12 — 2026-06-20
+
+### Ajouté
+- Snippet GTM compatible (`snippet_gtm`) dans `mark_snippet` : injection dynamique via `document.createElement('script')` pour les Custom HTML tags GTM.
+
+### Corrigé
+- Endpoint `POST /e` déplacé avant le guard `x-internal-secret` — le tracking navigateur n'était pas bloqué en prod mais la garde était mal ordonnée.
+- Snippet: attribut `async` ajouté pour éviter le blocage du rendu.
+- CLI `mark-init` : routage de `init` avant le chargement de la DB — corrige le crash `DATABASE_URL` sur `npx @silverbackbase/mark init`.
+
+---
+
+## v0.1.8 — 2026-06-13
+
+### Ajouté
+- Auto-tracking scroll depth (25 / 50 / 75 / 100 %) dans le snippet navigateur.
+
+---
+
 ## v0.1.7 — 2026-06-12
 
 ### Ajouté

@@ -81,6 +81,20 @@ export interface RecentEvent {
     slug: string;
     tag: string | null;
 }
+export interface BreakdownItem {
+    value: string | null;
+    sessions: number;
+    events: number;
+}
+export interface BreakdownResult {
+    slug: string;
+    event_name: string;
+    property: string;
+    period: string;
+    total_sessions: number;
+    breakdown: BreakdownItem[];
+    tag?: string;
+}
 export declare const LIMITS: {
     slug_max: number;
     event_name_max: number;
@@ -103,5 +117,6 @@ export declare function journey(workspaceId: string, slug: string, entity_id: st
 export declare function registerSnippet(workspaceId: string, url: string, slug: string): Promise<SnippetRow>;
 export declare function resolveUrl(workspaceId: string, url: string): Promise<SnippetRow | null>;
 export declare function listSnippets(workspaceId: string): Promise<SnippetRow[]>;
+export declare function breakdown(workspaceId: string, slug: string, event_name: string, property: string, days: number, tag?: string, limit?: number): Promise<BreakdownResult>;
 export declare function recentEvents(workspaceId: string, limit?: number): Promise<RecentEvent[]>;
 //# sourceMappingURL=db.d.ts.map

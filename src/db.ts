@@ -87,6 +87,22 @@ export interface RecentEvent {
   tag: string | null;
 }
 
+export interface BreakdownItem {
+  value: string | null;
+  sessions: number;
+  events: number;
+}
+
+export interface BreakdownResult {
+  slug: string;
+  event_name: string;
+  property: string;
+  period: string;
+  total_sessions: number;
+  breakdown: BreakdownItem[];
+  tag?: string;
+}
+
 export const LIMITS = {
   slug_max: 100,
   event_name_max: 100,
@@ -369,6 +385,49 @@ export async function resolveUrl(workspaceId: string, url: string): Promise<Snip
 export async function listSnippets(workspaceId: string): Promise<SnippetRow[]> {
   const rows = await sql`SELECT workspace_id, url, slug, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
   return rows.map(r => ({ workspace_id: r.workspace_id as string, url: r.url as string, slug: r.slug as string, created_at: Number(r.created_at) }));
+}
+
+export async function breakdown(
+  workspaceId: string,
+  slug: string,
+  event_name: string,
+  property: string,
+  days: number,
+  tag?: string,
+  limit = 30
+): Promise<BreakdownResult> {
+  const since = Date.now() - days * 86_400_000;
+  const t = tag ?? null;
+  const [totalRow] = await sql`
+    SELECT COUNT(DISTINCT session_id) AS n
+    FROM events
+    WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${event_name}
+      AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+  `;
+  const rows = await sql`
+    SELECT properties->>${property} AS value,
+           COUNT(DISTINCT session_id) AS sessions,
+           COUNT(*) AS events
+    FROM events
+    WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${event_name}
+      AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    GROUP BY value
+    ORDER BY sessions DESC
+    LIMIT ${limit}
+  `;
+  return {
+    slug,
+    event_name,
+    property,
+    period: `${days}d`,
+    total_sessions: Number((totalRow as { n: string }).n ?? 0),
+    breakdown: rows.map(r => ({
+      value: (r.value ?? null) as string | null,
+      sessions: Number(r.sessions),
+      events: Number(r.events),
+    })),
+    ...(tag ? { tag } : {}),
+  };
 }
 
 export async function recentEvents(workspaceId: string, limit = 50): Promise<RecentEvent[]> {

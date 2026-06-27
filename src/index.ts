@@ -51,6 +51,10 @@ function trackerScript(slug: string, wid: string): string {
     var el=e.target.closest('button,a,[role=button],input[type=submit],input[type=button]');
     if(!el) return;
     var label=(el.textContent||el.value||el.getAttribute('aria-label')||'').trim().slice(0,60);
+    if(el.tagName==='A'&&el.href&&el.href.indexOf('tel:')===0){
+      send('tel_click',{phone:el.href.replace('tel:','').trim(),label:label||undefined});
+      return;
+    }
     var tag=el.dataset.markEvent||null;
     send(tag||'click',{label:label||undefined,id:el.id||undefined,tag:el.dataset.markTag||undefined});
   });
@@ -355,7 +359,7 @@ Paste the returned snippet before </body>. Once loaded:
 - window.markjs.track(event_name, props) — record an event
 - window.markjs.identify(entityId) — link all subsequent events to an entity (user ID, form ID, etc.)
 - window.markjs.setTag(tag) — tag all subsequent events (e.g. "variant-a", "mobile")
-Auto-tracking: page_view, clicks on buttons/links, form_submit, page_exit are recorded automatically.
+Auto-tracking: page_view, clicks on buttons/links, tel_click (tel: links), form_submit, page_exit are recorded automatically.
 
 Limits: slug max ${LIMITS.slug_max} chars, event_name max ${LIMITS.event_name_max} chars,
 props max ${LIMITS.properties_max_keys} keys, string values max ${LIMITS.property_string_max} chars.

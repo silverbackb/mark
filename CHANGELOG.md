@@ -1,3 +1,10 @@
+## v0.1.14 — 2026-06-27
+
+### Ajouté
+- Auto-tracking `tel_click` dans le snippet navigateur : les clics sur liens `<a href="tel:...">` déclenchent automatiquement un event `tel_click` avec `{ phone, label }` au lieu du `click` générique.
+
+---
+
 ## v0.1.13 — 2026-06-24
 
 ### Ajouté

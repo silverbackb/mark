@@ -65,6 +65,30 @@ function trackerScript(slug, wid) {
 function htmlSnippet(slug, wid) {
     return `<script async src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
 }
+// Derive device / os / browser from the request User-Agent. Server-side so it
+// applies to every ingested event without touching the client snippet, and so
+// it can't be blocked or spoofed as easily as navigator.userAgent.
+function parseUA(ua) {
+    if (!ua)
+        return { device: "unknown", os: "unknown", browser: "unknown" };
+    const isTablet = /iPad|Tablet|PlayBook|Silk|Android(?!.*Mobile)/i.test(ua);
+    const isMobile = !isTablet && /Mobi|Android|iPhone|iPod|IEMobile|BlackBerry|Opera Mini/i.test(ua);
+    const device = isTablet ? "tablet" : isMobile ? "mobile" : "desktop";
+    const os = /iPhone|iPad|iPod/i.test(ua) ? "iOS"
+        : /Android/i.test(ua) ? "Android"
+            : /Windows/i.test(ua) ? "Windows"
+                : /Mac OS X|Macintosh/i.test(ua) ? "macOS"
+                    : /Linux/i.test(ua) ? "Linux"
+                        : "unknown";
+    // Order matters: Edge and Opera UAs also contain "Chrome"; Chrome contains "Safari".
+    const browser = /Edg\//i.test(ua) ? "Edge"
+        : /OPR\/|Opera/i.test(ua) ? "Opera"
+            : /Chrome\//i.test(ua) ? "Chrome"
+                : /Firefox\//i.test(ua) ? "Firefox"
+                    : /Safari\//i.test(ua) ? "Safari"
+                        : "unknown";
+    return { device, os, browser };
+}
 // GTM-compatible snippet: a bare <script src> inside a Custom HTML tag does not
 // execute reliably. GTM runs inline JS reliably, so we inject the script via DOM.
 function gtmSnippet(slug, wid) {
@@ -145,7 +169,11 @@ async function handleRequestAsync(req, res) {
                     // Network error → accept event anyway (don't break tracking)
                 }
             }
-            await insertEvent(workspace_id, slug, session_id, event_name, properties ?? {}, tag, entity_id, ts);
+            // Enrich with device/os/browser derived from the User-Agent.
+            // Explicit props from the caller win on key conflict.
+            const uaProps = parseUA(req.headers["user-agent"] ?? "");
+            const enriched = { ...uaProps, ...(properties ?? {}) };
+            await insertEvent(workspace_id, slug, session_id, event_name, enriched, tag, entity_id, ts);
             json(res, { ok: true });
         }
         catch {
@@ -299,7 +327,7 @@ function err(message) {
 async function main() {
     await migrate();
     startHttpServer();
-    const server = new McpServer({ name: "mark-mcp-server", version: "0.1.13" });
+    const server = new McpServer({ name: "mark-mcp-server", version: "0.1.15" });
     server.registerTool("mark_snippet", {
         title: "Get Tracking Snippet",
         description: `Generate the HTML <script> tag to embed in your app for event tracking.

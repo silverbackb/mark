@@ -1,3 +1,10 @@
+## v0.1.15 — 2026-07-07
+
+### Corrigé
+- Enrichissement `device` / `os` / `browser` côté serveur dans `POST /e` : dérivés du `User-Agent` de la requête et injectés dans les `properties` de chaque événement ingéré. Corrige le breakdown device qui renvoyait 100% de valeurs nulles (la propriété n'était collectée nulle part). Une valeur `device` explicite envoyée par l'appelant (`track()` custom) reste prioritaire. Non rétroactif : seuls les événements postérieurs au déploiement portent ces propriétés.
+
+---
+
 ## v0.1.14 — 2026-06-27
 
 ### Ajouté

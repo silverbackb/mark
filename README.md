@@ -49,7 +49,7 @@ Paste before `</body>` on every page:
 
 `slug` identifies the site. `wid` is your workspace ID — use any consistent string.
 
-Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `form_submit`, `page_exit`, and `scroll_depth` at 25/50/75/100%. Custom events:
+Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `tel_click` (`tel:` links), `form_submit`, `page_exit`, and `scroll_depth` at 25/50/75/100%. Every ingested event is also enriched server-side with `device` (mobile/tablet/desktop), `os` and `browser`, derived from the request User-Agent — group by them with `mark_breakdown`. Custom events:
 
 ```js
 window.markjs.track('signup_complete', { plan: 'pro' })

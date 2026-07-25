@@ -288,6 +288,19 @@ export async function resolveUrl(workspaceId, url) {
         return null;
     return { workspace_id: row.workspace_id, url: row.url, slug: row.slug, created_at: Number(row.created_at) };
 }
+/**
+ * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).
+ *
+ * La table snippets est unique sur (workspace_id, url) et NON sur le slug seul : deux
+ * workspaces peuvent donc theoriquement partager un meme slug. On renvoie la liste complete
+ * plutot qu'une valeur unique, pour que l'appelant puisse distinguer les trois cas (aucun
+ * proprietaire connu, un seul, plusieurs) et refuser de choisir quand c'est ambigu. Deviner
+ * serait exactement le "echec vers le faux" que le projet interdit.
+ */
+export async function workspacesForSlug(slug) {
+    const rows = await sql `SELECT DISTINCT workspace_id FROM snippets WHERE slug = ${slug}`;
+    return rows.map(r => r.workspace_id);
+}
 export async function listSnippets(workspaceId) {
     const rows = await sql `SELECT workspace_id, url, slug, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
     return rows.map(r => ({ workspace_id: r.workspace_id, url: r.url, slug: r.slug, created_at: Number(r.created_at) }));

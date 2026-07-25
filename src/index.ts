@@ -17,6 +17,7 @@ import {
   registerSnippet,
   resolveUrl,
   listSnippets,
+  workspacesForSlug,
   recentEvents,
   LIMITS,
 } from "./db.js";
@@ -272,10 +273,58 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
         json(res, { error: limitError }, 400);
         return;
       }
+
+      // --- Correctif C1 : le workspace est resolu SERVEUR, pas cru sur parole ---
+      //
+      // Cet endpoint est public et recevait le workspace_id dans le corps de la requete, alors
+      // que le tracker publie cette valeur en clair (mark.js?wid=...). N'importe qui pouvait
+      // donc lire le wid dans le code source d'un site equipe, puis injecter des evenements
+      // dans le workspace de ce client ET declencher son debit de facturation jusqu'a epuiser
+      // son solde.
+      //
+      // La source de verite est la table snippets, qui associe un slug a son workspace.
+      // Trois cas, traites differemment, car on ne devine jamais un proprietaire :
+      //   - un seul workspace connu pour ce slug : il fait autorite, la valeur du corps est
+      //     ignoree (et la divergence journalisee, c'est le signal d'une tentative d'injection)
+      //   - aucun workspace connu : on conserve le comportement historique pour ne pas couper
+      //     l'ingestion d'un client dont le snippet ne serait pas enregistre, mais on journalise
+      //   - plusieurs workspaces pour ce meme slug : ambigu, on ne choisit pas, on conserve le
+      //     comportement historique et on alerte
+      //
+      // Le mode self-hosted (workspace_id "local") n'est pas concerne.
+      let effectiveWorkspaceId = workspace_id;
+      if (workspace_id !== "local") {
+        try {
+          const owners = await workspacesForSlug(slug);
+          if (owners.length === 1) {
+            effectiveWorkspaceId = owners[0];
+            if (effectiveWorkspaceId !== workspace_id) {
+              console.warn(
+                `[mark] workspace_id du corps ignore pour le slug "${slug}" : ` +
+                `annonce "${workspace_id}", proprietaire reel "${effectiveWorkspaceId}"`,
+              );
+            }
+          } else if (owners.length === 0) {
+            console.warn(
+              `[mark] slug "${slug}" inconnu de la table snippets : workspace du corps conserve ` +
+              `("${workspace_id}"). Enregistrer ce snippet permettra de fermer cette porte.`,
+            );
+          } else {
+            console.warn(
+              `[mark] slug "${slug}" partage par ${owners.length} workspaces : resolution ambigue, ` +
+              `workspace du corps conserve ("${workspace_id}")`,
+            );
+          }
+        } catch (error) {
+          // Panne de lecture : on n'interrompt pas l'ingestion pour autant.
+          console.error(`[mark] resolution du workspace impossible pour le slug "${slug}":`, error);
+        }
+      }
+
       // Fire billing callback if configured
       const eventDebitUrl = process.env.SILVERBACKBASE_EVENT_DEBIT_URL;
       const eventDebitSecret = process.env.SILVERBACKBASE_EVENT_DEBIT_SECRET;
-      if (eventDebitUrl && eventDebitSecret && workspace_id !== "local") {
+      if (eventDebitUrl && eventDebitSecret && effectiveWorkspaceId !== "local") {
         try {
           const billRes = await fetch(eventDebitUrl, {
             method: "POST",
@@ -283,7 +332,9 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
               "Content-Type": "application/json",
               "x-internal-event-secret": eventDebitSecret,
             },
-            body: JSON.stringify({ workspace_id, event_name }),
+            // effectiveWorkspaceId et non workspace_id : c'est le proprietaire reel du slug qui
+            // est debite, jamais le workspace annonce par l'appelant (correctif C1).
+            body: JSON.stringify({ workspace_id: effectiveWorkspaceId, event_name }),
           });
           if (billRes.status === 402) {
             json(res, { error: "Insufficient balance" }, 402);
@@ -298,7 +349,9 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       // Explicit props from the caller win on key conflict.
       const uaProps = parseUA((req.headers["user-agent"] as string | undefined) ?? "");
       const enriched = clampProperties({ ...uaProps, ...(properties ?? {}) });
-      await insertEvent(workspace_id, slug, session_id, event_name, enriched, tag, entity_id, ts);
+      // effectiveWorkspaceId : l'evenement est ecrit chez le proprietaire reel du slug
+      // (correctif C1), pas chez le workspace annonce dans le corps de la requete.
+      await insertEvent(effectiveWorkspaceId, slug, session_id, event_name, enriched, tag, entity_id, ts);
       json(res, { ok: true });
     } catch {
       json(res, { error: "Invalid JSON" }, 400);

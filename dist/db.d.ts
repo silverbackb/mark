@@ -119,6 +119,16 @@ export declare function friction(workspaceId: string, slug: string, days: number
 export declare function journey(workspaceId: string, slug: string, entity_id: string, days: number): Promise<JourneyResult>;
 export declare function registerSnippet(workspaceId: string, url: string, slug: string): Promise<SnippetRow>;
 export declare function resolveUrl(workspaceId: string, url: string): Promise<SnippetRow | null>;
+/**
+ * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).
+ *
+ * La table snippets est unique sur (workspace_id, url) et NON sur le slug seul : deux
+ * workspaces peuvent donc theoriquement partager un meme slug. On renvoie la liste complete
+ * plutot qu'une valeur unique, pour que l'appelant puisse distinguer les trois cas (aucun
+ * proprietaire connu, un seul, plusieurs) et refuser de choisir quand c'est ambigu. Deviner
+ * serait exactement le "echec vers le faux" que le projet interdit.
+ */
+export declare function workspacesForSlug(slug: string): Promise<string[]>;
 export declare function listSnippets(workspaceId: string): Promise<SnippetRow[]>;
 export declare function breakdown(workspaceId: string, slug: string, event_name: string, property: string, days: number, tag?: string, limit?: number): Promise<BreakdownResult>;
 export declare function recentEvents(workspaceId: string, limit?: number): Promise<RecentEvent[]>;

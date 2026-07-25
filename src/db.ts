@@ -148,6 +148,10 @@ export async function migrate(): Promise<void> {
   await sql`CREATE INDEX IF NOT EXISTS idx_slug_ts ON events(slug, ts)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_slug_tag ON events(slug, tag)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_entity ON events(slug, entity_id)`;
+  // Predicat exact de summary / funnel / friction / breakdown : workspace_id = ? AND slug = ?
+  // AND ts >= ?. Aucun index existant ne couvre les trois colonnes ensemble (idx_workspace_slug
+  // s'arrete a slug, idx_slug_ts commence par slug sans workspace_id).
+  await sql`CREATE INDEX IF NOT EXISTS idx_workspace_slug_ts ON events(workspace_id, slug, ts)`;
   await sql`
     CREATE TABLE IF NOT EXISTS snippets (
       id BIGSERIAL PRIMARY KEY,
@@ -194,6 +198,36 @@ export async function purge(workspaceId: string, slug: string): Promise<{ delete
     SELECT COUNT(*) AS n FROM deleted
   `;
   return { deleted: Number((result[0] as { n: string }).n) };
+}
+
+// Nombre de lignes traitees par lot de purge. Borne la duree et l'emprise de chaque DELETE
+// individuel : un DELETE de plusieurs millions de lignes verrouillerait la table le temps de
+// l'instruction, un DELETE par lots de 5000 rend chaque instruction courte et libere les locks
+// entre deux lots.
+const PURGE_BATCH_SIZE = 5000;
+
+// Purge d'age, alignee sur le modele Trail (voir code/trail/packages/server/src/index.ts,
+// purgeOldTouchpoints) : supprime tous les evenements plus vieux que retentionDays, tous
+// workspaces confondus. Bornee par lots (voir PURGE_BATCH_SIZE) plutot qu'un DELETE massif
+// unique. FOR UPDATE SKIP LOCKED rend la fonction sure si plusieurs instances la declenchent en
+// meme temps : chaque instance saute les lignes deja verrouillees par une autre au lieu
+// d'attendre, et deux appels concurrents ou repetes ne font que supprimer un sous-ensemble
+// decroissant de lignes deja qualifiees (ts < cutoff), donc idempotent par construction.
+export async function purgeOldEvents(retentionDays: number): Promise<{ removed: number }> {
+  const cutoff = Date.now() - retentionDays * 86_400_000;
+  let removed = 0;
+  for (;;) {
+    const rows = await sql`
+      DELETE FROM events
+      WHERE id IN (
+        SELECT id FROM events WHERE ts < ${cutoff} LIMIT ${PURGE_BATCH_SIZE} FOR UPDATE SKIP LOCKED
+      )
+      RETURNING 1
+    `;
+    removed += rows.length;
+    if (rows.length < PURGE_BATCH_SIZE) break;
+  }
+  return { removed };
 }
 
 // =============================================================================

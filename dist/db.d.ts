@@ -108,6 +108,9 @@ export declare function insertEvent(workspaceId: string, slug: string, session_i
 export declare function purge(workspaceId: string, slug: string): Promise<{
     deleted: number;
 }>;
+export declare function purgeOldEvents(retentionDays: number): Promise<{
+    removed: number;
+}>;
 export declare function listSlugs(workspaceId: string): Promise<EventRow[]>;
 export declare function summary(workspaceId: string, slug: string, days: number, tag?: string): Promise<SummaryResult>;
 export declare function funnel(workspaceId: string, slug: string, steps: string[], days: number, tag?: string): Promise<FunnelResult>;

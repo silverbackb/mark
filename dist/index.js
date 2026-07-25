@@ -2,12 +2,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "node:http";
 import { z } from "zod";
-import { migrate, insertEvent, listSlugs, summary, funnel, compare, friction, journey, breakdown, purge, registerSnippet, resolveUrl, listSnippets, recentEvents, LIMITS, } from "./db.js";
+import { migrate, insertEvent, listSlugs, summary, funnel, compare, friction, journey, breakdown, purge, purgeOldEvents, registerSnippet, resolveUrl, listSnippets, recentEvents, LIMITS, } from "./db.js";
 import { resolveQueryWorkspaceId } from "./workspace-guard.js";
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
 const MCP_WORKSPACE_ID = process.env.MARK_WORKSPACE_ID ?? "local";
+// Retention par defaut alignee sur Trail (voir code/trail/packages/server/src/index.ts).
+const RETENTION_DAYS = parseInt(process.env.MARK_RETENTION_DAYS ?? "365", 10);
 // --- HTTP tracker script ---
 function trackerScript(slug, wid) {
     return `(function(){
@@ -423,6 +425,23 @@ function startHttpServer() {
         }
     });
 }
+// Purge d'age (C21), meme cadence que Trail (purgeOldTouchpoints) : une fois au demarrage puis
+// toutes les 24h. purgeOldEvents est elle-meme bornee par lots et sure en cas de demarrage
+// simultane de plusieurs instances (voir db.ts).
+async function runRetentionPurge() {
+    try {
+        const { removed } = await purgeOldEvents(RETENTION_DAYS);
+        if (removed > 0) {
+            process.stderr.write(JSON.stringify({
+                service: "mark", event: "purge", removed, retention_days: RETENTION_DAYS,
+                timestamp: new Date().toISOString(),
+            }) + "\n");
+        }
+    }
+    catch (e) {
+        process.stderr.write(`[mark] purge failed: ${e instanceof Error ? e.message : String(e)}\n`);
+    }
+}
 // --- MCP helpers ---
 function ok(data) {
     return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
@@ -434,6 +453,8 @@ function err(message) {
 async function main() {
     await migrate();
     startHttpServer();
+    await runRetentionPurge();
+    setInterval(runRetentionPurge, 24 * 60 * 60 * 1000);
     const server = new McpServer({ name: "mark-mcp-server", version: "0.1.15" });
     server.registerTool("mark_snippet", {
         title: "Get Tracking Snippet",

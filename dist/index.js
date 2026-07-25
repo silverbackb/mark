@@ -108,6 +108,84 @@ function json(res, data, status = 200) {
     res.writeHead(status);
     res.end(JSON.stringify(data));
 }
+// Taille maximale acceptee pour le corps d'un evenement. Un evenement analytics normal pese
+// moins de 2 Ko : 64 Ko laisse une marge confortable tout en fermant la porte a un POST de
+// plusieurs centaines de Mo qui ferait gonfler la RSS du process jusqu'a l'OOM Railway.
+const MAX_BODY_BYTES = 64 * 1024;
+// Delai maximal de reception du corps, pour qu'une connexion ouverte puis laissee muette ne
+// retienne pas une socket indefiniment.
+const BODY_TIMEOUT_MS = 10_000;
+class BodyTooLargeError extends Error {
+}
+class BodyTimeoutError extends Error {
+}
+// Accumule le corps de la requete en bornant a la fois la taille et la duree. Rejette des le
+// depassement plutot que de continuer a lire une charge qu'on refusera de toute facon.
+function readBoundedBody(req) {
+    return new Promise((resolve, reject) => {
+        const chunks = [];
+        let size = 0;
+        let settled = false;
+        const finish = (fn) => {
+            if (settled)
+                return;
+            settled = true;
+            clearTimeout(timer);
+            req.removeAllListeners("data");
+            req.removeAllListeners("end");
+            req.removeAllListeners("error");
+            fn();
+        };
+        const timer = setTimeout(() => {
+            finish(() => {
+                req.destroy();
+                reject(new BodyTimeoutError("Body read timed out"));
+            });
+        }, BODY_TIMEOUT_MS);
+        req.on("data", (chunk) => {
+            size += chunk.length;
+            if (size > MAX_BODY_BYTES) {
+                finish(() => {
+                    req.destroy();
+                    reject(new BodyTooLargeError("Body too large"));
+                });
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on("end", () => finish(() => resolve(Buffer.concat(chunks).toString("utf8"))));
+        req.on("error", (e) => finish(() => reject(e)));
+    });
+}
+// Applique l'objet LIMITS, qui n'etait jusqu'ici utilise que dans les descriptions MCP et jamais
+// a l'insertion. Deux traitements distincts, volontairement :
+//   - les champs qui servent de CLE (slug, event_name, tag, entity_id) sont refuses s'ils
+//     depassent : les tronquer ferait pointer l'evenement vers une autre cle, donc un autre
+//     regroupement. C'est le cas "echec vers le faux" que le projet interdit.
+//   - les properties sont du contenu descriptif : on borne le nombre de cles et on tronque les
+//     valeurs texte plutot que de perdre l'evenement entier.
+function checkEventKeys(slug, event_name, tag, entity_id) {
+    if (slug.length > LIMITS.slug_max)
+        return `slug exceeds ${LIMITS.slug_max} chars`;
+    if (event_name.length > LIMITS.event_name_max)
+        return `event_name exceeds ${LIMITS.event_name_max} chars`;
+    if (tag && tag.length > LIMITS.tag_max)
+        return `tag exceeds ${LIMITS.tag_max} chars`;
+    if (entity_id && entity_id.length > LIMITS.entity_id_max)
+        return `entity_id exceeds ${LIMITS.entity_id_max} chars`;
+    return null;
+}
+function clampProperties(properties) {
+    const out = {};
+    for (const [key, value] of Object.entries(properties)) {
+        if (Object.keys(out).length >= LIMITS.properties_max_keys)
+            break;
+        out[key] = typeof value === "string" && value.length > LIMITS.property_string_max
+            ? value.slice(0, LIMITS.property_string_max)
+            : value;
+    }
+    return out;
+}
 async function handleRequestAsync(req, res) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -133,17 +211,32 @@ async function handleRequestAsync(req, res) {
     }
     // --- Ingestion (public — no secret required, workspace_id in body) ---
     if (req.method === "POST" && url.pathname === "/e") {
-        const body = await new Promise((resolve, reject) => {
-            let data = "";
-            req.on("data", (chunk) => { data += chunk.toString(); });
-            req.on("end", () => resolve(data));
-            req.on("error", reject);
-        });
+        let body;
+        try {
+            body = await readBoundedBody(req);
+        }
+        catch (e) {
+            if (e instanceof BodyTooLargeError) {
+                json(res, { error: "Payload too large" }, 413);
+            }
+            else if (e instanceof BodyTimeoutError) {
+                json(res, { error: "Request timeout" }, 408);
+            }
+            else {
+                json(res, { error: "Invalid request" }, 400);
+            }
+            return;
+        }
         try {
             const parsed = JSON.parse(body);
             const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
             if (!workspace_id || !slug || !session_id || !event_name) {
                 json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
+                return;
+            }
+            const limitError = checkEventKeys(slug, event_name, tag, entity_id);
+            if (limitError) {
+                json(res, { error: limitError }, 400);
                 return;
             }
             // Fire billing callback if configured
@@ -172,7 +265,7 @@ async function handleRequestAsync(req, res) {
             // Enrich with device/os/browser derived from the User-Agent.
             // Explicit props from the caller win on key conflict.
             const uaProps = parseUA(req.headers["user-agent"] ?? "");
-            const enriched = { ...uaProps, ...(properties ?? {}) };
+            const enriched = clampProperties({ ...uaProps, ...(properties ?? {}) });
             await insertEvent(workspace_id, slug, session_id, event_name, enriched, tag, entity_id, ts);
             json(res, { ok: true });
         }

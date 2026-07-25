@@ -1,0 +1,1 @@
+{"version":3,"file":"workspace-guard.d.ts","sourceRoot":"","sources":["../src/workspace-guard.ts"],"names":[],"mappings":"AAGA,MAAM,MAAM,mBAAmB,GAC3B;IAAE,EAAE,EAAE,IAAI,CAAC;IAAC,WAAW,EAAE,MAAM,CAAA;CAAE,GACjC;IAAE,EAAE,EAAE,KAAK,CAAA;CAAE,CAAC;AAElB,wBAAgB,uBAAuB,CAAC,SAAS,EAAE,OAAO,EAAE,SAAS,EAAE,MAAM,GAAG,SAAS,GAAG,mBAAmB,CAM9G"}

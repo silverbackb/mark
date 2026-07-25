@@ -19,6 +19,7 @@ import {
   recentEvents,
   LIMITS,
 } from "./db.js";
+import { resolveQueryWorkspaceId } from "./workspace-guard.js";
 
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
@@ -313,17 +314,17 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     return;
   }
 
-  const wid = ((req.headers["x-workspace-id"] as string | undefined) ?? "").trim();
-
   // En mode cloud, un x-workspace-id absent, vide ou blanc ne doit jamais retomber sur "",
   // qui est exactement le DEFAULT des lignes Mark historiques en base : une regression de la
   // passerelle lirait alors silencieusement un lot de donnees partage plutot que d'echouer.
   // Regle du projet : echec vers le vide, jamais vers le faux. En self-hosted (pas de secret
   // configure), le comportement existant est conserve.
-  if (cloudMode && wid === "") {
+  const widDecision = resolveQueryWorkspaceId(cloudMode, req.headers["x-workspace-id"] as string | undefined);
+  if (!widDecision.ok) {
     json(res, { error: "Missing or empty x-workspace-id header" }, 401);
     return;
   }
+  const wid = widDecision.workspaceId;
 
   if (req.method === "GET" && url.pathname === "/q/list") {
     json(res, await listSlugs(wid));

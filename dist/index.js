@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createServer } from "node:http";
 import { z } from "zod";
 import { migrate, insertEvent, listSlugs, summary, funnel, compare, friction, journey, breakdown, purge, registerSnippet, resolveUrl, listSnippets, recentEvents, LIMITS, } from "./db.js";
+import { resolveQueryWorkspaceId } from "./workspace-guard.js";
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
@@ -277,11 +278,24 @@ async function handleRequestAsync(req, res) {
     // --- Query endpoints (workspace_id from x-workspace-id header) ---
     // Require x-internal-secret when configured (open in self-hosted mode)
     const internalSecret = process.env.MARK_INTERNAL_SECRET ?? "";
-    if (internalSecret && req.headers["x-internal-secret"] !== internalSecret) {
+    // C'est la configuration (secret interne present) qui decide du mode, jamais la valeur
+    // recue dans la requete.
+    const cloudMode = internalSecret.length > 0;
+    if (cloudMode && req.headers["x-internal-secret"] !== internalSecret) {
         json(res, { error: "Unauthorized" }, 401);
         return;
     }
-    const wid = req.headers["x-workspace-id"] ?? "";
+    // En mode cloud, un x-workspace-id absent, vide ou blanc ne doit jamais retomber sur "",
+    // qui est exactement le DEFAULT des lignes Mark historiques en base : une regression de la
+    // passerelle lirait alors silencieusement un lot de donnees partage plutot que d'echouer.
+    // Regle du projet : echec vers le vide, jamais vers le faux. En self-hosted (pas de secret
+    // configure), le comportement existant est conserve.
+    const widDecision = resolveQueryWorkspaceId(cloudMode, req.headers["x-workspace-id"]);
+    if (!widDecision.ok) {
+        json(res, { error: "Missing or empty x-workspace-id header" }, 401);
+        return;
+    }
+    const wid = widDecision.workspaceId;
     if (req.method === "GET" && url.pathname === "/q/list") {
         json(res, await listSlugs(wid));
         return;

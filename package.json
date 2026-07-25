@@ -12,7 +12,8 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
   },
   "files": [
     "dist",

@@ -305,12 +305,25 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
   // --- Query endpoints (workspace_id from x-workspace-id header) ---
   // Require x-internal-secret when configured (open in self-hosted mode)
   const internalSecret = process.env.MARK_INTERNAL_SECRET ?? "";
-  if (internalSecret && req.headers["x-internal-secret"] !== internalSecret) {
+  // C'est la configuration (secret interne present) qui decide du mode, jamais la valeur
+  // recue dans la requete.
+  const cloudMode = internalSecret.length > 0;
+  if (cloudMode && req.headers["x-internal-secret"] !== internalSecret) {
     json(res, { error: "Unauthorized" }, 401);
     return;
   }
 
-  const wid = (req.headers["x-workspace-id"] as string | undefined) ?? "";
+  const wid = ((req.headers["x-workspace-id"] as string | undefined) ?? "").trim();
+
+  // En mode cloud, un x-workspace-id absent, vide ou blanc ne doit jamais retomber sur "",
+  // qui est exactement le DEFAULT des lignes Mark historiques en base : une regression de la
+  // passerelle lirait alors silencieusement un lot de donnees partage plutot que d'echouer.
+  // Regle du projet : echec vers le vide, jamais vers le faux. En self-hosted (pas de secret
+  // configure), le comportement existant est conserve.
+  if (cloudMode && wid === "") {
+    json(res, { error: "Missing or empty x-workspace-id header" }, 401);
+    return;
+  }
 
   if (req.method === "GET" && url.pathname === "/q/list") {
     json(res, await listSlugs(wid));

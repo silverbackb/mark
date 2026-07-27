@@ -9,6 +9,15 @@ const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
 const MCP_WORKSPACE_ID = process.env.MARK_WORKSPACE_ID ?? "local";
+// Mode cloud vs self-hosted : determine par la presence d'un secret interne configure par
+// l'operateur, exactement comme pour l'auth des routes /register et /q/* plus bas (meme const
+// recalculee ici, avant que handleRequestAsync ne l'etablisse localement). PAS par
+// MCP_WORKSPACE_ID : ce dernier vaut "local" par defaut des que MARK_WORKSPACE_ID est absent —
+// ce qui est le cas sur le service cloud lui-meme (rien ne le positionne dans Railway), puisqu'il
+// ne sert qu'aux outils MCP stdio (usage self-hosted exclusif, jamais atteints par la passerelle
+// cloud qui parle HTTP). Le confondre avec la detection cloud/self-hosted de POST /e aurait rendu
+// le service cloud "self-hosted" par defaut — un trou de securite plus large que celui corrige.
+const CLOUD_MODE = (process.env.MARK_INTERNAL_SECRET ?? "").length > 0;
 // Retention par defaut alignee sur Trail (voir code/trail/packages/server/src/index.ts).
 const RETENTION_DAYS = parseInt(process.env.MARK_RETENTION_DAYS ?? "365", 10);
 // --- HTTP tracker script ---
@@ -288,15 +297,15 @@ async function handleRequestAsync(req, res) {
             // resolution -> quarantaine (202), sans ecriture ni debit — jamais de repli qui accepterait
             // une valeur du corps (c'etait exactement la porte laissee ouverte par l'ancien C1).
             //
-            // Mode self-hosted : lu depuis la CONFIGURATION du serveur (MCP_WORKSPACE_ID, variable
-            // d'environnement posee par l'operateur), jamais depuis le corps de la requete. Avant ce
-            // correctif, ce mode etait detecte via `workspace_id === "local"` fourni par le corps : sur
-            // le service cloud, n'importe qui pouvait donc envoyer {workspace_id:"local"} pour
-            // contourner a la fois la resolution par Origin et le debit de facturation — un trou de
-            // securite independant du slug, trouve en finalisant cette migration. En self-hosted, il n'y
-            // a ni registre multi-tenant ni facturation a proteger : le project_id du corps y reste
-            // digne de confiance (l'operateur est le seul appelant possible de sa propre instance).
-            const isSelfHosted = MCP_WORKSPACE_ID === "local";
+            // Mode self-hosted : lu depuis CLOUD_MODE, la CONFIGURATION du serveur (secret interne
+            // pose par l'operateur), jamais depuis le corps de la requete. Avant ce correctif, ce mode
+            // etait detecte via `workspace_id === "local"` fourni par le corps : sur le service cloud,
+            // n'importe qui pouvait donc envoyer {workspace_id:"local"} pour contourner a la fois la
+            // resolution par Origin et le debit de facturation — un trou de securite independant du
+            // slug, trouve en finalisant cette migration. En self-hosted, il n'y a ni registre
+            // multi-tenant ni facturation a proteger : le project_id du corps y reste digne de
+            // confiance (l'operateur est le seul appelant possible de sa propre instance).
+            const isSelfHosted = !CLOUD_MODE;
             let effectiveWorkspaceId;
             let effectiveProjectId;
             if (isSelfHosted) {

@@ -113,10 +113,16 @@ export const LIMITS = {
   property_string_max: 500,
 };
 
+// Miroir de normalizeDomain (silverbackbase_website/app/account/_lib/domain.ts) : le domaine
+// canonique enregistre via POST /register n'a jamais de "www." (retire a la source cote registre),
+// mais l'Origin/Referer reel envoye par un navigateur l'a systematiquement pour les clients reels
+// verifies en prod. Sans ce retrait sur le hostname, resolveByUrl ne matchait jamais : la
+// resolution par domaine echouait en silence pour tous les clients.
 function normalizeUrl(url: string): string {
   try {
     const u = new URL(url.trim());
-    return u.origin + u.pathname.replace(/\/$/, "");
+    const hostname = u.hostname.replace(/^www\./, "");
+    return `${u.protocol}//${hostname}${u.port ? `:${u.port}` : ""}${u.pathname.replace(/\/$/, "")}`;
   } catch {
     return url.trim().replace(/\/$/, "");
   }

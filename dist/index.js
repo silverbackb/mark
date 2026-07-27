@@ -606,7 +606,9 @@ async function main() {
     server.registerTool("mark_snippet", {
         title: "Get Tracking Snippet",
         description: `Generate the HTML <script> tag to embed in your app for event tracking.
-Optionally registers the URL → slug association so it can be retrieved later with mark_resolve.
+The tag is identical for every client: Mark resolves the workspace and client (project_id) itself
+from the domain of the page that loads it (Origin/Referer), so it never needs to be edited.
+Optionally registers the URL → project_id association so it can be retrieved later with mark_resolve.
 
 Paste the returned snippet before </body>. Once loaded:
 - window.markjs.track(event_name, props) — record an event
@@ -614,16 +616,15 @@ Paste the returned snippet before </body>. Once loaded:
 - window.markjs.setTag(tag) — tag all subsequent events (e.g. "variant-a", "mobile")
 Auto-tracking: page_view, clicks on buttons/links, tel_click (tel: links), form_submit, page_exit are recorded automatically.
 
-Limits: slug max ${LIMITS.slug_max} chars, event_name max ${LIMITS.event_name_max} chars,
-props max ${LIMITS.properties_max_keys} keys, string values max ${LIMITS.property_string_max} chars.
+Limits: event_name max ${LIMITS.event_name_max} chars, props max ${LIMITS.properties_max_keys} keys,
+string values max ${LIMITS.property_string_max} chars.
 
 Args:
-  - slug (string): Unique identifier for your app or page (e.g. "onboarding", "game-v2")
-  - url (string, optional): URL of the site or page being instrumented — registers the URL→slug mapping for future lookup
+  - project_id (string): Client this site belongs to
+  - url (string, optional): URL of the site being instrumented — registers the URL→project_id mapping for future lookup, and is the condition for ingestion to attribute events to this client
 
-Returns: { snippet, snippet_gtm, ingestion_url, usage, registered? }
-  - snippet: standard <script> for direct insertion before </body>
-  - snippet_gtm: GTM-compatible version (dynamic injection) for a Custom HTML tag`,
+Returns: { snippet, ingestion_url, usage, registered? }
+  - snippet: single universal <script> tag, works identically in the <head> or a GTM Custom HTML tag`,
         inputSchema: z.object({
             project_id: z.string().min(1).max(200).describe("Client identifier this site belongs to"),
             url: z.string().url().optional().describe("URL of the site being instrumented — registers the domain → project_id mapping, condition for ingestion to attribute events"),
@@ -646,16 +647,16 @@ Returns: { snippet, snippet_gtm, ingestion_url, usage, registered? }
         return ok(result);
     });
     server.registerTool("mark_resolve", {
-        title: "Resolve URL to Slug",
-        description: `Look up the slug registered for a given URL.
-Use before instrumenting a site to check if it's already been set up, and retrieve the correct slug.
+        title: "Resolve URL to Client",
+        description: `Look up the client (project_id) registered for a given URL.
+Use before instrumenting a site to check if it's already been set up, and retrieve the correct project_id.
 
 Args:
   - url (string): URL to look up (exact match after normalization — trailing slash ignored, fragment ignored)
 
-Returns: { url, slug, created_at } if found, or { found: false } if no snippet is registered for this URL.
+Returns: { url, project_id, created_at } if found, or { found: false } if no snippet is registered for this URL.
 
-Use when: you're about to instrument a site and want to know if a slug already exists for it.
+Use when: you're about to instrument a site and want to know which client it's already linked to.
 Complement with mark_list_snippets to see all registered URLs.`,
         inputSchema: z.object({
             url: z.string().min(1).describe("URL to look up"),
@@ -667,11 +668,11 @@ Complement with mark_list_snippets to see all registered URLs.`,
     });
     server.registerTool("mark_list_snippets", {
         title: "List Registered Snippets",
-        description: `List all URL→slug registrations, ordered by most recently created.
+        description: `List all URL→client registrations, ordered by most recently created.
 
-Returns: Array of { url, slug, created_at }
+Returns: Array of { url, project_id, created_at }
 
-Use when: you want to see which sites have been instrumented and which slug each one uses.`,
+Use when: you want to see which sites have been instrumented and which client each one belongs to.`,
         inputSchema: z.object({}).strict(),
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     }, async () => ok(await listSnippets(MCP_WORKSPACE_ID)));
@@ -888,11 +889,11 @@ Complement with mark_funnel to measure conversion from a specific page.`,
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     }, async ({ project_id, event_name, property, days, tag, limit }) => ok(await breakdown(MCP_WORKSPACE_ID, project_id, event_name, property, days ?? 30, tag, limit ?? 30)));
     server.registerTool("mark_purge", {
-        title: "Purge Slug Data",
-        description: `Delete all event data for a slug. Irreversible.
+        title: "Purge Client Data",
+        description: `Delete all event data for a client. Irreversible.
 
 Args:
-  - slug (string): Identifier to purge
+  - project_id (string): Client whose events are all deleted
 
 Returns: { deleted: number }
 

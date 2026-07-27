@@ -17,12 +17,14 @@ import {
   registerSnippet,
   resolveUrl,
   resolveByUrl,
+  resolveBySlug,
+  insertUnresolvedEvent,
   listSnippets,
-  workspacesForSlug,
   recentEvents,
   LIMITS,
 } from "./db.js";
 import { resolveQueryWorkspaceId } from "./workspace-guard.js";
+import { resolveEventOwner, siteOriginFrom, type Owner } from "./event-owner.js";
 
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
@@ -320,61 +322,76 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
         properties?: Record<string, unknown>;
         tag?: string; entity_id?: string; ts?: number; project_id?: string;
       };
-      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts, project_id } = parsed;
-      if (!workspace_id || !slug || !session_id || !event_name) {
-        json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
+      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
+      // slug et workspace_id ne sont plus exiges : les trackers deja poses les envoient encore, les
+      // nouveaux non. Ce qui reste obligatoire, c'est ce qui decrit l'evenement lui-meme.
+      if (!session_id || !event_name) {
+        json(res, { error: "Missing required fields: session_id, event_name" }, 400);
         return;
       }
-      const limitError = checkEventKeys(slug, event_name, tag, entity_id);
+      const limitError = checkEventKeys(slug ?? "", event_name, tag, entity_id);
       if (limitError) {
         json(res, { error: limitError }, 400);
         return;
       }
 
-      // --- Correctif C1 : le workspace est resolu SERVEUR, pas cru sur parole ---
+      // --- Le proprietaire de l'evenement est resolu SERVEUR, jamais cru sur parole ---
       //
-      // Cet endpoint est public et recevait le workspace_id dans le corps de la requete, alors
-      // que le tracker publie cette valeur en clair (mark.js?wid=...). N'importe qui pouvait
-      // donc lire le wid dans le code source d'un site equipe, puis injecter des evenements
-      // dans le workspace de ce client ET declencher son debit de facturation jusqu'a epuiser
-      // son solde.
+      // Cet endpoint est public. Tout identifiant present dans le corps (workspace_id, project_id)
+      // est lisible dans le code source de n'importe quelle page equipee : le croire permettrait
+      // d'injecter des evenements chez un client ET de declencher son debit jusqu'a epuiser son
+      // solde. C'est le correctif C1, ici etendu au project_id qui devient la cle de segmentation.
       //
-      // La source de verite est la table snippets, qui associe un slug a son workspace.
-      // Trois cas, traites differemment, car on ne devine jamais un proprietaire :
-      //   - un seul workspace connu pour ce slug : il fait autorite, la valeur du corps est
-      //     ignoree (et la divergence journalisee, c'est le signal d'une tentative d'injection)
-      //   - aucun workspace connu : on conserve le comportement historique pour ne pas couper
-      //     l'ingestion d'un client dont le snippet ne serait pas enregistre, mais on journalise
-      //   - plusieurs workspaces pour ce meme slug : ambigu, on ne choisit pas, on conserve le
-      //     comportement historique et on alerte
+      // Deux chemins de resolution, plus une issue de secours :
+      //   1. Origin (fallback Referer) -> table snippets. Chemin nominal. Origin est un en-tete
+      //      interdit d'ecriture pour du JS de page : le tracker ne peut pas le falsifier.
+      //   2. Slug du corps -> table snippets, si et seulement s'il designe un unique proprietaire.
+      //      Chemin de transition pour les trackers deja poses chez les clients.
+      //   3. Ni l'un ni l'autre -> quarantaine (202), sans ecriture ni debit.
       //
-      // Le mode self-hosted (workspace_id "local") n'est pas concerne.
-      let effectiveWorkspaceId = workspace_id;
-      if (workspace_id !== "local") {
+      // L'ancienne branche permissive (« slug inconnu : on garde le workspace du corps ») est
+      // supprimee : c'etait precisement la porte laissee ouverte par C1.
+      //
+      // Le mode self-hosted (workspace_id "local") n'a ni registre ni facturation : inchange.
+      const isSelfHosted = workspace_id === "local";
+      let effectiveWorkspaceId = workspace_id ?? "";
+      let effectiveProjectId: string | null = null;
+
+      if (!isSelfHosted) {
+        const headers = {
+          origin: req.headers["origin"] as string | undefined,
+          referer: req.headers["referer"] as string | undefined,
+        };
+        const siteOrigin = siteOriginFrom(headers);
+
+        let owner: Owner | null = null;
         try {
-          const owners = await workspacesForSlug(slug);
-          if (owners.length === 1) {
-            effectiveWorkspaceId = owners[0];
-            if (effectiveWorkspaceId !== workspace_id) {
-              console.warn(
-                `[mark] workspace_id du corps ignore pour le slug "${slug}" : ` +
-                `annonce "${workspace_id}", proprietaire reel "${effectiveWorkspaceId}"`,
-              );
-            }
-          } else if (owners.length === 0) {
-            console.warn(
-              `[mark] slug "${slug}" inconnu de la table snippets : workspace du corps conserve ` +
-              `("${workspace_id}"). Enregistrer ce snippet permettra de fermer cette porte.`,
-            );
-          } else {
-            console.warn(
-              `[mark] slug "${slug}" partage par ${owners.length} workspaces : resolution ambigue, ` +
-              `workspace du corps conserve ("${workspace_id}")`,
-            );
-          }
+          owner = await resolveEventOwner({ ...headers, slug }, {
+            byOrigin: resolveByUrl,
+            bySlug: resolveBySlug,
+          });
         } catch (error) {
-          // Panne de lecture : on n'interrompt pas l'ingestion pour autant.
-          console.error(`[mark] resolution du workspace impossible pour le slug "${slug}":`, error);
+          console.error(`[mark] resolution du proprietaire impossible (origin "${siteOrigin}"):`, error);
+        }
+
+        if (!owner) {
+          // Ni domaine enregistre, ni slug resolvable. On ne devine pas, mais on ne perd rien.
+          try {
+            await insertUnresolvedEvent(siteOrigin || null, parsed);
+          } catch (error) {
+            console.error("[mark] mise en quarantaine impossible:", error);
+          }
+          json(res, { ok: true, quarantined: true }, 202);
+          return;
+        }
+
+        effectiveWorkspaceId = owner.workspace_id;
+        effectiveProjectId = owner.project_id;
+        if (workspace_id && workspace_id !== effectiveWorkspaceId) {
+          console.warn(
+            `[mark] workspace_id du corps ignore : annonce "${workspace_id}", ` +
+            `proprietaire reel "${effectiveWorkspaceId}"`,
+          );
         }
       }
 
@@ -406,10 +423,10 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       // Explicit props from the caller win on key conflict.
       const uaProps = parseUA((req.headers["user-agent"] as string | undefined) ?? "");
       const enriched = clampProperties({ ...uaProps, ...(properties ?? {}) });
-      // effectiveWorkspaceId : l'evenement est ecrit chez le proprietaire reel du slug
-      // (correctif C1), pas chez le workspace annonce dans le corps de la requete.
-      // project_id : resolu server-side sur GET /mark.js (jamais devine ici), transmis tel quel.
-      await insertEvent(effectiveWorkspaceId, slug, session_id, event_name, enriched, tag, entity_id, ts, project_id ?? null);
+      // effectiveWorkspaceId / effectiveProjectId : le proprietaire reel resolu ci-dessus, jamais
+      // les valeurs annoncees dans le corps. Le slug recu est conserve tel quel tant que la colonne
+      // existe : c'est la piste d'audit qui permettrait de rejouer ou de contester une attribution.
+      await insertEvent(effectiveWorkspaceId, slug ?? null, session_id, event_name, enriched, tag, entity_id, ts, effectiveProjectId);
       json(res, { ok: true });
     } catch {
       json(res, { error: "Invalid JSON" }, 400);

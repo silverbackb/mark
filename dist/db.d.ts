@@ -105,7 +105,27 @@ export declare const LIMITS: {
     property_string_max: number;
 };
 export declare function migrate(): Promise<void>;
-export declare function insertEvent(workspaceId: string, slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number, projectId?: string | null): Promise<void>;
+export declare function insertEvent(workspaceId: string, slug: string | null, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number, projectId?: string | null): Promise<void>;
+/**
+ * Chemin legacy de l'ingestion : resout le proprietaire depuis le slug encore envoye par les
+ * trackers deja poses chez les clients, quand l'en-tete Origin est absent ou inconnu.
+ *
+ * Ne resout que si le slug designe UN SEUL couple (workspace, projet) : deux workspaces peuvent
+ * partager un slug (l'unicite de `snippets` porte sur (workspace_id, url), jamais sur le slug),
+ * et dans ce cas on ne choisit pas. Retourne null plutot que de deviner — l'appelant met alors
+ * l'evenement en quarantaine au lieu de l'attribuer au hasard.
+ */
+export declare function resolveBySlug(slug: string): Promise<{
+    workspace_id: string;
+    project_id: string;
+} | null>;
+/**
+ * Met en quarantaine un evenement dont le proprietaire n'a pas pu etre resolu server-side.
+ *
+ * Ni ecrit dans `events` (il polluerait les donnees d'un client), ni rejete (il serait perdu :
+ * l'appel du tracker est fire-and-forget, sans retry). Rejouable une fois le domaine enregistre.
+ */
+export declare function insertUnresolvedEvent(origin: string | null, payload: unknown): Promise<void>;
 export declare function purge(workspaceId: string, slug: string): Promise<{
     deleted: number;
 }>;
@@ -138,6 +158,7 @@ export declare function resolveUrl(workspaceId: string, url: string): Promise<Sn
 export declare function resolveByUrl(url: string): Promise<{
     workspace_id: string;
     project_id: string | null;
+    slug: string | null;
 } | null>;
 /**
  * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).

@@ -12,10 +12,16 @@ export const LIMITS = {
     properties_max_keys: 50,
     property_string_max: 500,
 };
+// Miroir de normalizeDomain (silverbackbase_website/app/account/_lib/domain.ts) : le domaine
+// canonique enregistre via POST /register n'a jamais de "www." (retire a la source cote registre),
+// mais l'Origin/Referer reel envoye par un navigateur l'a systematiquement pour les clients reels
+// verifies en prod. Sans ce retrait sur le hostname, resolveByUrl ne matchait jamais : la
+// resolution par domaine echouait en silence pour tous les clients.
 function normalizeUrl(url) {
     try {
         const u = new URL(url.trim());
-        return u.origin + u.pathname.replace(/\/$/, "");
+        const hostname = u.hostname.replace(/^www\./, "");
+        return `${u.protocol}//${hostname}${u.port ? `:${u.port}` : ""}${u.pathname.replace(/\/$/, "")}`;
     }
     catch {
         return url.trim().replace(/\/$/, "");
@@ -40,10 +46,19 @@ export async function migrate() {
   `;
     // Add workspace_id to existing tables that were created before this migration
     await sql `ALTER TABLE events ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''`;
-    // project_id : resolu server-side par domaine (voir resolveByUrl / GET mark.js), stocke tel
-    // quel a l'ingestion. Nullable : le peuplement des lignes existantes se fait via POST /register,
-    // jamais par une migration SQL directe.
+    // project_id : identite du client, resolue server-side par domaine (voir resolveByUrl). Devient
+    // la cle de segmentation de Mark a la place du slug (migration du 2026-07-27). Reste nullable
+    // pendant toute la transition : une ligne non attribuable ne doit jamais faire echouer un INSERT.
     await sql `ALTER TABLE events ADD COLUMN IF NOT EXISTS project_id TEXT`;
+    // slug relache AVANT que quoi que ce soit cesse d'en envoyer un. L'ordre compte : le tracker est
+    // servi en no-store, il se met a jour au premier chargement de page chez le client, et un INSERT
+    // qui echoue sur un event navigateur est une perte definitive (fire-and-forget, aucun retry).
+    await sql `ALTER TABLE events ALTER COLUMN slug DROP NOT NULL`;
+    // Index miroirs des index slug ci-dessous, pour que la bascule des lectures ne degrade rien.
+    await sql `CREATE INDEX IF NOT EXISTS idx_workspace_project ON events(workspace_id, project_id)`;
+    await sql `CREATE INDEX IF NOT EXISTS idx_workspace_project_ts ON events(workspace_id, project_id, ts)`;
+    await sql `CREATE INDEX IF NOT EXISTS idx_project_event ON events(project_id, event_name)`;
+    await sql `CREATE INDEX IF NOT EXISTS idx_project_entity ON events(project_id, entity_id)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_workspace ON events(workspace_id)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_workspace_slug ON events(workspace_id, slug)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_slug ON events(slug)`;
@@ -80,6 +95,21 @@ export async function migrate() {
     // resolveByUrl filtre sur la colonne url seule ; l'index unique existant est compose
     // (workspace_id, url) et ne couvre pas efficacement une recherche par url seule.
     await sql `CREATE INDEX IF NOT EXISTS idx_snippets_url ON snippets(url)`;
+    await sql `CREATE INDEX IF NOT EXISTS idx_snippets_project ON snippets(project_id)`;
+    // Quarantaine. Un event dont on ne sait pas a qui il appartient n'est ni ecrit dans events (il
+    // polluerait un client), ni rejete (il serait perdu) : il atterrit ici, non facturable et absent
+    // des lectures, rejouable une fois le domaine enregistre via POST /register. C'est ce qui permet
+    // de tenir ensemble les deux exigences contradictoires du chantier : aucun event perdu, et aucun
+    // identifiant issu du corps de la requete.
+    await sql `
+    CREATE TABLE IF NOT EXISTS events_unresolved (
+      id BIGSERIAL PRIMARY KEY,
+      origin TEXT,
+      payload JSONB NOT NULL,
+      received_at BIGINT NOT NULL
+    )
+  `;
+    await sql `CREATE INDEX IF NOT EXISTS idx_unresolved_received ON events_unresolved(received_at)`;
 }
 // =============================================================================
 // MUTATIONS
@@ -88,6 +118,37 @@ export async function insertEvent(workspaceId, slug, session_id, event_name, pro
     await sql `
     INSERT INTO events (workspace_id, slug, session_id, event_name, properties, ts, tag, entity_id, project_id)
     VALUES (${workspaceId}, ${slug}, ${session_id}, ${event_name}, ${properties}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null}, ${projectId ?? null})
+  `;
+}
+/**
+ * Chemin legacy de l'ingestion : resout le proprietaire depuis le slug encore envoye par les
+ * trackers deja poses chez les clients, quand l'en-tete Origin est absent ou inconnu.
+ *
+ * Ne resout que si le slug designe UN SEUL couple (workspace, projet) : deux workspaces peuvent
+ * partager un slug (l'unicite de `snippets` porte sur (workspace_id, url), jamais sur le slug),
+ * et dans ce cas on ne choisit pas. Retourne null plutot que de deviner — l'appelant met alors
+ * l'evenement en quarantaine au lieu de l'attribuer au hasard.
+ */
+export async function resolveBySlug(slug) {
+    const rows = await sql `
+    SELECT DISTINCT workspace_id, project_id FROM snippets
+    WHERE slug = ${slug} AND project_id IS NOT NULL
+  `;
+    if (rows.length !== 1)
+        return null;
+    const row = rows[0];
+    return { workspace_id: row.workspace_id, project_id: row.project_id };
+}
+/**
+ * Met en quarantaine un evenement dont le proprietaire n'a pas pu etre resolu server-side.
+ *
+ * Ni ecrit dans `events` (il polluerait les donnees d'un client), ni rejete (il serait perdu :
+ * l'appel du tracker est fire-and-forget, sans retry). Rejouable une fois le domaine enregistre.
+ */
+export async function insertUnresolvedEvent(origin, payload) {
+    await sql `
+    INSERT INTO events_unresolved (origin, payload, received_at)
+    VALUES (${origin}, ${payload}, ${Date.now()})
   `;
 }
 export async function purge(workspaceId, slug) {
@@ -335,7 +396,7 @@ export async function resolveUrl(workspaceId, url) {
  */
 export async function resolveByUrl(url) {
     const normalized = normalizeUrl(url);
-    const rows = await sql `SELECT workspace_id, project_id FROM snippets WHERE url = ${normalized}`;
+    const rows = await sql `SELECT workspace_id, project_id, slug FROM snippets WHERE url = ${normalized}`;
     if (rows.length === 0)
         return null;
     const workspaces = new Set(rows.map(r => r.workspace_id));
@@ -343,7 +404,13 @@ export async function resolveByUrl(url) {
         return null;
     const withProjectId = rows.find(r => r.project_id != null);
     const projectId = withProjectId ? withProjectId.project_id : null;
-    return { workspace_id: [...workspaces][0], project_id: projectId };
+    // Le slug enregistre pour ce domaine, pour que le tag <script> nu (sans query string) n'envoie
+    // pas tous les clients sous "default". On ne devine rien : plusieurs slugs enregistres sur le
+    // meme domaine est un cas legitime (plusieurs apps suivies separement) mais ambigu ici, donc on
+    // ne resout que s'il n'y en a qu'un seul. Sinon null, et l'appelant retombe sur "default".
+    const slugs = new Set(rows.map(r => r.slug).filter(Boolean));
+    const slug = slugs.size === 1 ? [...slugs][0] : null;
+    return { workspace_id: [...workspaces][0], project_id: projectId, slug };
 }
 /**
  * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).

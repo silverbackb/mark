@@ -148,10 +148,19 @@ export async function migrate(): Promise<void> {
   `;
   // Add workspace_id to existing tables that were created before this migration
   await sql`ALTER TABLE events ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''`;
-  // project_id : resolu server-side par domaine (voir resolveByUrl / GET mark.js), stocke tel
-  // quel a l'ingestion. Nullable : le peuplement des lignes existantes se fait via POST /register,
-  // jamais par une migration SQL directe.
+  // project_id : identite du client, resolue server-side par domaine (voir resolveByUrl). Devient
+  // la cle de segmentation de Mark a la place du slug (migration du 2026-07-27). Reste nullable
+  // pendant toute la transition : une ligne non attribuable ne doit jamais faire echouer un INSERT.
   await sql`ALTER TABLE events ADD COLUMN IF NOT EXISTS project_id TEXT`;
+  // slug relache AVANT que quoi que ce soit cesse d'en envoyer un. L'ordre compte : le tracker est
+  // servi en no-store, il se met a jour au premier chargement de page chez le client, et un INSERT
+  // qui echoue sur un event navigateur est une perte definitive (fire-and-forget, aucun retry).
+  await sql`ALTER TABLE events ALTER COLUMN slug DROP NOT NULL`;
+  // Index miroirs des index slug ci-dessous, pour que la bascule des lectures ne degrade rien.
+  await sql`CREATE INDEX IF NOT EXISTS idx_workspace_project ON events(workspace_id, project_id)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_workspace_project_ts ON events(workspace_id, project_id, ts)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_project_event ON events(project_id, event_name)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_project_entity ON events(project_id, entity_id)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_workspace ON events(workspace_id)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_workspace_slug ON events(workspace_id, slug)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_slug ON events(slug)`;
@@ -188,6 +197,22 @@ export async function migrate(): Promise<void> {
   // resolveByUrl filtre sur la colonne url seule ; l'index unique existant est compose
   // (workspace_id, url) et ne couvre pas efficacement une recherche par url seule.
   await sql`CREATE INDEX IF NOT EXISTS idx_snippets_url ON snippets(url)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_snippets_project ON snippets(project_id)`;
+
+  // Quarantaine. Un event dont on ne sait pas a qui il appartient n'est ni ecrit dans events (il
+  // polluerait un client), ni rejete (il serait perdu) : il atterrit ici, non facturable et absent
+  // des lectures, rejouable une fois le domaine enregistre via POST /register. C'est ce qui permet
+  // de tenir ensemble les deux exigences contradictoires du chantier : aucun event perdu, et aucun
+  // identifiant issu du corps de la requete.
+  await sql`
+    CREATE TABLE IF NOT EXISTS events_unresolved (
+      id BIGSERIAL PRIMARY KEY,
+      origin TEXT,
+      payload JSONB NOT NULL,
+      received_at BIGINT NOT NULL
+    )
+  `;
+  await sql`CREATE INDEX IF NOT EXISTS idx_unresolved_received ON events_unresolved(received_at)`;
 }
 
 // =============================================================================
@@ -196,7 +221,7 @@ export async function migrate(): Promise<void> {
 
 export async function insertEvent(
   workspaceId: string,
-  slug: string,
+  slug: string | null,
   session_id: string,
   event_name: string,
   properties: Record<string, unknown> = {},
@@ -208,6 +233,38 @@ export async function insertEvent(
   await sql`
     INSERT INTO events (workspace_id, slug, session_id, event_name, properties, ts, tag, entity_id, project_id)
     VALUES (${workspaceId}, ${slug}, ${session_id}, ${event_name}, ${properties as never}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null}, ${projectId ?? null})
+  `;
+}
+
+/**
+ * Chemin legacy de l'ingestion : resout le proprietaire depuis le slug encore envoye par les
+ * trackers deja poses chez les clients, quand l'en-tete Origin est absent ou inconnu.
+ *
+ * Ne resout que si le slug designe UN SEUL couple (workspace, projet) : deux workspaces peuvent
+ * partager un slug (l'unicite de `snippets` porte sur (workspace_id, url), jamais sur le slug),
+ * et dans ce cas on ne choisit pas. Retourne null plutot que de deviner — l'appelant met alors
+ * l'evenement en quarantaine au lieu de l'attribuer au hasard.
+ */
+export async function resolveBySlug(slug: string): Promise<{ workspace_id: string; project_id: string } | null> {
+  const rows = await sql`
+    SELECT DISTINCT workspace_id, project_id FROM snippets
+    WHERE slug = ${slug} AND project_id IS NOT NULL
+  `;
+  if (rows.length !== 1) return null;
+  const row = rows[0] as { workspace_id: string; project_id: string };
+  return { workspace_id: row.workspace_id, project_id: row.project_id };
+}
+
+/**
+ * Met en quarantaine un evenement dont le proprietaire n'a pas pu etre resolu server-side.
+ *
+ * Ni ecrit dans `events` (il polluerait les donnees d'un client), ni rejete (il serait perdu :
+ * l'appel du tracker est fire-and-forget, sans retry). Rejouable une fois le domaine enregistre.
+ */
+export async function insertUnresolvedEvent(origin: string | null, payload: unknown): Promise<void> {
+  await sql`
+    INSERT INTO events_unresolved (origin, payload, received_at)
+    VALUES (${origin}, ${payload as never}, ${Date.now()})
   `;
 }
 

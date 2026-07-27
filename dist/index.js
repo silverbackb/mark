@@ -2,16 +2,13 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createServer } from "node:http";
 import { z } from "zod";
-import { migrate, insertEvent, listProjects, summary, funnel, compare, friction, journey, breakdown, purge, purgeOldEvents, registerSnippet, resolveUrl, resolveByUrl, resolveBySlug, resolveReadTarget, insertUnresolvedEvent, listSnippets, recentEvents, LIMITS, } from "./db.js";
+import { migrate, insertEvent, listProjects, summary, funnel, compare, friction, journey, breakdown, purge, purgeOldEvents, registerSnippet, resolveUrl, resolveByUrl, insertUnresolvedEvent, listSnippets, recentEvents, LIMITS, } from "./db.js";
 import { resolveQueryWorkspaceId } from "./workspace-guard.js";
 import { resolveEventOwner, siteOriginFrom } from "./event-owner.js";
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
 const MCP_WORKSPACE_ID = process.env.MARK_WORKSPACE_ID ?? "local";
-// snippets.slug est encore NOT NULL le temps de la transition : les nouveaux enregistrements y
-// posent une valeur neutre, la colonne disparaitra avec le reste du slug.
-const DEFAULT_SLUG = "default";
 // Retention par defaut alignee sur Trail (voir code/trail/packages/server/src/index.ts).
 const RETENTION_DAYS = parseInt(process.env.MARK_RETENTION_DAYS ?? "365", 10);
 // --- HTTP tracker script ---
@@ -161,14 +158,12 @@ function readBoundedBody(req) {
 }
 // Applique l'objet LIMITS, qui n'etait jusqu'ici utilise que dans les descriptions MCP et jamais
 // a l'insertion. Deux traitements distincts, volontairement :
-//   - les champs qui servent de CLE (slug, event_name, tag, entity_id) sont refuses s'ils
-//     depassent : les tronquer ferait pointer l'evenement vers une autre cle, donc un autre
-//     regroupement. C'est le cas "echec vers le faux" que le projet interdit.
+//   - les champs qui servent de CLE (event_name, tag, entity_id) sont refuses s'ils depassent :
+//     les tronquer ferait pointer l'evenement vers une autre cle, donc un autre regroupement.
+//     C'est le cas "echec vers le faux" que le projet interdit.
 //   - les properties sont du contenu descriptif : on borne le nombre de cles et on tronque les
 //     valeurs texte plutot que de perdre l'evenement entier.
-function checkEventKeys(slug, event_name, tag, entity_id) {
-    if (slug.length > LIMITS.slug_max)
-        return `slug exceeds ${LIMITS.slug_max} chars`;
+function checkEventKeys(event_name, tag, entity_id) {
     if (event_name.length > LIMITS.event_name_max)
         return `event_name exceeds ${LIMITS.event_name_max} chars`;
     if (tag && tag.length > LIMITS.tag_max)
@@ -271,14 +266,12 @@ async function handleRequestAsync(req, res) {
         }
         try {
             const parsed = JSON.parse(body);
-            const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
-            // slug et workspace_id ne sont plus exiges : les trackers deja poses les envoient encore, les
-            // nouveaux non. Ce qui reste obligatoire, c'est ce qui decrit l'evenement lui-meme.
+            const { workspace_id, session_id, event_name, properties, tag, entity_id, ts } = parsed;
             if (!session_id || !event_name) {
                 json(res, { error: "Missing required fields: session_id, event_name" }, 400);
                 return;
             }
-            const limitError = checkEventKeys(slug ?? "", event_name, tag, entity_id);
+            const limitError = checkEventKeys(event_name, tag, entity_id);
             if (limitError) {
                 json(res, { error: limitError }, 400);
                 return;
@@ -288,23 +281,29 @@ async function handleRequestAsync(req, res) {
             // Cet endpoint est public. Tout identifiant present dans le corps (workspace_id, project_id)
             // est lisible dans le code source de n'importe quelle page equipee : le croire permettrait
             // d'injecter des evenements chez un client ET de declencher son debit jusqu'a epuiser son
-            // solde. C'est le correctif C1, ici etendu au project_id qui devient la cle de segmentation.
+            // solde. C'est le correctif C1, etendu au project_id qui est desormais la cle de segmentation.
             //
-            // Deux chemins de resolution, plus une issue de secours :
-            //   1. Origin (fallback Referer) -> table snippets. Chemin nominal. Origin est un en-tete
-            //      interdit d'ecriture pour du JS de page : le tracker ne peut pas le falsifier.
-            //   2. Slug du corps -> table snippets, si et seulement s'il designe un unique proprietaire.
-            //      Chemin de transition pour les trackers deja poses chez les clients.
-            //   3. Ni l'un ni l'autre -> quarantaine (202), sans ecriture ni debit.
+            // Seul chemin de resolution : Origin (fallback Referer) -> table snippets. Origin est un
+            // en-tete interdit d'ecriture pour du JS de page, le tracker ne peut pas le falsifier. Sans
+            // resolution -> quarantaine (202), sans ecriture ni debit — jamais de repli qui accepterait
+            // une valeur du corps (c'etait exactement la porte laissee ouverte par l'ancien C1).
             //
-            // L'ancienne branche permissive (« slug inconnu : on garde le workspace du corps ») est
-            // supprimee : c'etait precisement la porte laissee ouverte par C1.
-            //
-            // Le mode self-hosted (workspace_id "local") n'a ni registre ni facturation : inchange.
-            const isSelfHosted = workspace_id === "local";
-            let effectiveWorkspaceId = workspace_id ?? "";
-            let effectiveProjectId = null;
-            if (!isSelfHosted) {
+            // Mode self-hosted : lu depuis la CONFIGURATION du serveur (MCP_WORKSPACE_ID, variable
+            // d'environnement posee par l'operateur), jamais depuis le corps de la requete. Avant ce
+            // correctif, ce mode etait detecte via `workspace_id === "local"` fourni par le corps : sur
+            // le service cloud, n'importe qui pouvait donc envoyer {workspace_id:"local"} pour
+            // contourner a la fois la resolution par Origin et le debit de facturation — un trou de
+            // securite independant du slug, trouve en finalisant cette migration. En self-hosted, il n'y
+            // a ni registre multi-tenant ni facturation a proteger : le project_id du corps y reste
+            // digne de confiance (l'operateur est le seul appelant possible de sa propre instance).
+            const isSelfHosted = MCP_WORKSPACE_ID === "local";
+            let effectiveWorkspaceId;
+            let effectiveProjectId;
+            if (isSelfHosted) {
+                effectiveWorkspaceId = MCP_WORKSPACE_ID;
+                effectiveProjectId = parsed.project_id ?? null;
+            }
+            else {
                 const headers = {
                     origin: req.headers["origin"],
                     referer: req.headers["referer"],
@@ -312,16 +311,14 @@ async function handleRequestAsync(req, res) {
                 const siteOrigin = siteOriginFrom(headers);
                 let owner = null;
                 try {
-                    owner = await resolveEventOwner({ ...headers, slug }, {
-                        byOrigin: resolveByUrl,
-                        bySlug: resolveBySlug,
-                    });
+                    owner = await resolveEventOwner(headers, { byOrigin: resolveByUrl });
                 }
                 catch (error) {
                     console.error(`[mark] resolution du proprietaire impossible (origin "${siteOrigin}"):`, error);
                 }
                 if (!owner) {
-                    // Ni domaine enregistre, ni slug resolvable. On ne devine pas, mais on ne perd rien.
+                    // Domaine absent, inconnu, ou sans project_id enregistre. On ne devine pas, mais on ne
+                    // perd rien : rejouable des que le domaine est enregistre via POST /register.
                     try {
                         await insertUnresolvedEvent(siteOrigin || null, parsed);
                     }
@@ -349,8 +346,8 @@ async function handleRequestAsync(req, res) {
                             "Content-Type": "application/json",
                             "x-internal-event-secret": eventDebitSecret,
                         },
-                        // effectiveWorkspaceId et non workspace_id : c'est le proprietaire reel du slug qui
-                        // est debite, jamais le workspace annonce par l'appelant (correctif C1).
+                        // effectiveWorkspaceId et non workspace_id : c'est le proprietaire reel resolu par
+                        // Origin qui est debite, jamais le workspace annonce par l'appelant (correctif C1).
                         body: JSON.stringify({ workspace_id: effectiveWorkspaceId, event_name }),
                     });
                     if (billRes.status === 402) {
@@ -368,9 +365,8 @@ async function handleRequestAsync(req, res) {
             const uaProps = parseUA(req.headers["user-agent"] ?? "");
             const enriched = clampProperties({ ...uaProps, ...(properties ?? {}) });
             // effectiveWorkspaceId / effectiveProjectId : le proprietaire reel resolu ci-dessus, jamais
-            // les valeurs annoncees dans le corps. Le slug recu est conserve tel quel tant que la colonne
-            // existe : c'est la piste d'audit qui permettrait de rejouer ou de contester une attribution.
-            await insertEvent(effectiveWorkspaceId, slug ?? null, session_id, event_name, enriched, tag, entity_id, ts, effectiveProjectId);
+            // les valeurs annoncees dans le corps.
+            await insertEvent(effectiveWorkspaceId, session_id, event_name, enriched, tag, entity_id, ts, effectiveProjectId);
             json(res, { ok: true });
         }
         catch {
@@ -402,8 +398,7 @@ async function handleRequestAsync(req, res) {
     // Enregistre le project_id d'un domaine pour le workspace authentifie (wid resolu depuis le
     // header, jamais depuis le corps — meme principe que le reste de ce bloc). Appele par la
     // passerelle silverbackbase-mcp, typiquement avec l'URL racine du site : project_id est une
-    // notion de domaine, pas de page. Ne remplace jamais un slug deja enregistre pour ce domaine :
-    // si l'appelant du snippet a deja pose un slug custom sur cette URL, il est conserve tel quel.
+    // notion de domaine, pas de page.
     if (req.method === "POST" && url.pathname === "/register") {
         let body;
         try {
@@ -428,9 +423,7 @@ async function handleRequestAsync(req, res) {
                 json(res, { error: "Missing required fields: project_id, url" }, 400);
                 return;
             }
-            const existing = await resolveUrl(wid, siteUrl);
-            const slug = existing?.slug ?? "default";
-            const reg = await registerSnippet(wid, siteUrl, slug, project_id);
+            const reg = await registerSnippet(wid, siteUrl, project_id);
             json(res, { ok: true, project_id: reg.project_id, url: reg.url });
         }
         catch {
@@ -450,7 +443,7 @@ async function handleRequestAsync(req, res) {
     }
     const summaryMatch = url.pathname.match(/^\/q\/summary\/(.+)$/);
     if (req.method === "GET" && summaryMatch) {
-        const projectId = await resolveReadTarget(wid, decodeURIComponent(summaryMatch[1]));
+        const projectId = decodeURIComponent(summaryMatch[1]);
         const days = parseInt(url.searchParams.get("days") ?? "7", 10);
         const tag = url.searchParams.get("tag") ?? undefined;
         json(res, await summary(wid, projectId, isNaN(days) ? 7 : days, tag));
@@ -458,7 +451,7 @@ async function handleRequestAsync(req, res) {
     }
     const funnelMatch = url.pathname.match(/^\/q\/funnel\/(.+)$/);
     if (req.method === "GET" && funnelMatch) {
-        const projectId = await resolveReadTarget(wid, decodeURIComponent(funnelMatch[1]));
+        const projectId = decodeURIComponent(funnelMatch[1]);
         const stepsParam = url.searchParams.get("steps") ?? "";
         const steps = stepsParam.split(",").map((s) => s.trim()).filter(Boolean);
         const days = parseInt(url.searchParams.get("days") ?? "30", 10);
@@ -472,7 +465,7 @@ async function handleRequestAsync(req, res) {
     }
     const compareMatch = url.pathname.match(/^\/q\/compare\/(.+)$/);
     if (req.method === "GET" && compareMatch) {
-        const projectId = await resolveReadTarget(wid, decodeURIComponent(compareMatch[1]));
+        const projectId = decodeURIComponent(compareMatch[1]);
         const pivot = url.searchParams.get("pivot") ?? "";
         if (!pivot || isNaN(new Date(pivot).getTime())) {
             json(res, { error: "pivot param required — ISO date e.g. 2026-06-01" }, 400);
@@ -487,7 +480,7 @@ async function handleRequestAsync(req, res) {
     }
     const frictionMatch = url.pathname.match(/^\/q\/friction\/(.+)$/);
     if (req.method === "GET" && frictionMatch) {
-        const projectId = await resolveReadTarget(wid, decodeURIComponent(frictionMatch[1]));
+        const projectId = decodeURIComponent(frictionMatch[1]);
         const days = parseInt(url.searchParams.get("days") ?? "30", 10);
         const tag = url.searchParams.get("tag") ?? undefined;
         json(res, await friction(wid, projectId, isNaN(days) ? 30 : days, tag));
@@ -495,7 +488,7 @@ async function handleRequestAsync(req, res) {
     }
     const journeyMatch = url.pathname.match(/^\/q\/journey\/(.+)$/);
     if (req.method === "GET" && journeyMatch) {
-        const projectId = await resolveReadTarget(wid, decodeURIComponent(journeyMatch[1]));
+        const projectId = decodeURIComponent(journeyMatch[1]);
         const entity_id = url.searchParams.get("entity_id") ?? "";
         if (!entity_id) {
             json(res, { error: "entity_id param required" }, 400);
@@ -507,7 +500,7 @@ async function handleRequestAsync(req, res) {
     }
     const breakdownMatch = url.pathname.match(/^\/q\/breakdown\/(.+)$/);
     if (req.method === "GET" && breakdownMatch) {
-        const projectId = await resolveReadTarget(wid, decodeURIComponent(breakdownMatch[1]));
+        const projectId = decodeURIComponent(breakdownMatch[1]);
         const event_name = url.searchParams.get("event") ?? "";
         const property = url.searchParams.get("property") ?? "";
         if (!event_name || !property) {
@@ -526,22 +519,22 @@ async function handleRequestAsync(req, res) {
             endpoints: [
                 {
                     method: "POST", path: "/e",
-                    body: { slug: "string", session_id: "string", event_name: "string", properties: "object?", tag: "string?", entity_id: "string?", ts: "number? (unix ms)" },
-                    description: "Ingest an event",
+                    body: { session_id: "string", event_name: "string", properties: "object?", tag: "string?", entity_id: "string?", ts: "number? (unix ms)" },
+                    description: "Ingest an event — owner resolved server-side from the Origin/Referer header, never from the body",
                 },
                 {
                     method: "POST", path: "/register",
                     body: { project_id: "string", url: "string (domain root, resolved server-side per workspace from x-workspace-id)" },
                     description: "Register the project_id for a domain (authenticated, cloud mode only)",
                 },
-                { method: "GET", path: "/logs/recent", params: { limit: "number (default 50, max 200)" }, description: "Recent events across all slugs" },
-                { method: "GET", path: "/q/list", description: "List active slugs" },
-                { method: "GET", path: "/q/summary/:slug", params: { days: "number (default 7)", tag: "string?" }, description: "Session and event overview" },
-                { method: "GET", path: "/q/funnel/:slug", params: { steps: "comma-separated event names (min 2)", days: "number (default 30)", tag: "string?" }, description: "Funnel conversion by step" },
-                { method: "GET", path: "/q/compare/:slug", params: { pivot: "ISO date", event: "string?", days_before: "number (default 14)", days_after: "number (default 14)", tag: "string?" }, description: "Compare behavior before vs after a date" },
-                { method: "GET", path: "/q/friction/:slug", params: { days: "number (default 30)", tag: "string?" }, description: "Drop-off points by event sequence" },
-                { method: "GET", path: "/q/journey/:slug", params: { entity_id: "string (required)", days: "number (default 30)" }, description: "All events for a specific entity" },
-                { method: "GET", path: "/q/breakdown/:slug", params: { event: "string (required)", property: "string (required)", days: "number (default 30)", tag: "string?", limit: "number (default 30, max 100)" }, description: "Group an event by a property value — e.g. page_view by url" },
+                { method: "GET", path: "/logs/recent", params: { limit: "number (default 50, max 200)", project_id: "string? (scope to one client)" }, description: "Recent events across all clients, or one if project_id is given" },
+                { method: "GET", path: "/q/list", description: "List active clients" },
+                { method: "GET", path: "/q/summary/:project_id", params: { days: "number (default 7)", tag: "string?" }, description: "Session and event overview" },
+                { method: "GET", path: "/q/funnel/:project_id", params: { steps: "comma-separated event names (min 2)", days: "number (default 30)", tag: "string?" }, description: "Funnel conversion by step" },
+                { method: "GET", path: "/q/compare/:project_id", params: { pivot: "ISO date", event: "string?", days_before: "number (default 14)", days_after: "number (default 14)", tag: "string?" }, description: "Compare behavior before vs after a date" },
+                { method: "GET", path: "/q/friction/:project_id", params: { days: "number (default 30)", tag: "string?" }, description: "Drop-off points by event sequence" },
+                { method: "GET", path: "/q/journey/:project_id", params: { entity_id: "string (required)", days: "number (default 30)" }, description: "All events for a specific entity" },
+                { method: "GET", path: "/q/breakdown/:project_id", params: { event: "string (required)", property: "string (required)", days: "number (default 30)", tag: "string?", limit: "number (default 30, max 100)" }, description: "Group an event by a property value — e.g. page_view by url" },
             ],
         });
         return;
@@ -640,7 +633,7 @@ Returns: { snippet, ingestion_url, usage, registered? }
             },
         };
         if (url) {
-            const reg = await registerSnippet(MCP_WORKSPACE_ID, url, DEFAULT_SLUG, project_id);
+            const reg = await registerSnippet(MCP_WORKSPACE_ID, url, project_id);
             result.registered = reg;
         }
         return ok(result);
@@ -680,7 +673,7 @@ Use when: you want to see which sites have been instrumented and which client ea
         description: `Inject a synthetic event directly from the agent. Useful for testing, seeding, or recording agent-side actions.
 
 Args:
-  - slug (string): Identifier of the app or page
+  - project_id (string): Client identifier
   - session_id (string): Unique session identifier
   - event_name (string): Event name — same vocabulary as your instrumentation
   - properties (object, optional): Key-value metadata. Max ${LIMITS.properties_max_keys} keys, strings max ${LIMITS.property_string_max} chars.
@@ -688,7 +681,7 @@ Args:
   - entity_id (string, optional): Persistent entity identifier (user ID, form ID). Max ${LIMITS.entity_id_max} chars.
   - ts (number, optional): Custom timestamp as Unix ms — use to backdate or replay historical events.
 
-Returns: { ok: true, slug, event_name }`,
+Returns: { ok: true, project_id, event_name }`,
         inputSchema: z.object({
             project_id: z.string().min(1).max(200).describe("App or page identifier"),
             session_id: z.string().min(1).describe("Unique session identifier"),
@@ -701,10 +694,7 @@ Returns: { ok: true, slug, event_name }`,
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     }, async ({ project_id, session_id, event_name, properties, tag, entity_id, ts }) => {
         try {
-            // project_id en dernier argument : la 2e position est la colonne slug, en voie de
-            // suppression. L'y passer ecrirait l'identifiant client dans la mauvaise colonne, sans que
-            // le typage ne s'en apercoive (les deux sont des string).
-            await insertEvent(MCP_WORKSPACE_ID, null, session_id, event_name, (properties ?? {}), tag, entity_id, ts, project_id);
+            await insertEvent(MCP_WORKSPACE_ID, session_id, event_name, (properties ?? {}), tag, entity_id, ts, project_id);
             return ok({ ok: true, project_id, event_name });
         }
         catch (e) {
@@ -730,7 +720,7 @@ Args:
   - days (number, optional): Lookback window in days (default 7, max 365)
   - tag (string, optional): Filter to events with this tag only — useful for comparing segments
 
-Returns: { slug, period, sessions, events, top_events[], tag? }
+Returns: { project_id, period, sessions, events, top_events[], tag? }
 
 Use when: you want a quick health check. Call mark_friction or mark_funnel for deeper analysis.`,
         inputSchema: z.object({
@@ -750,7 +740,7 @@ Args:
   - days (number, optional): Lookback window in days (default 30)
   - tag (string, optional): Filter to a specific segment — e.g. compare "variant-a" vs "variant-b" by calling twice
 
-Returns: { slug, steps, counts[], rates[], drop_at, tag? }
+Returns: { project_id, steps, counts[], rates[], drop_at, tag? }
   - rates[]: conversion rate vs step 0 (0.0–1.0)
   - drop_at: step with the largest absolute drop-off
 
@@ -805,7 +795,7 @@ Args:
   - days (number, optional): Lookback window in days (default 30)
   - tag (string, optional): Filter to a specific segment
 
-Returns: { slug, total_sessions, drop_events[], tag? }
+Returns: { project_id, total_sessions, drop_events[], tag? }
   - drop_events[]: { event, sessions_reached, sessions_stopped_here, drop_rate }
 
 Use when: you don't know which step is the problem — let Mark surface the friction point.
@@ -829,7 +819,7 @@ Args:
 
 Returns:
   {
-    "slug": string,
+    "project_id": string,
     "entity_id": string,
     "total_events": number,
     "events": [{ "ts": number, "event_name": string, "session_id": string, "properties": object, "tag": string|null }]
@@ -866,7 +856,7 @@ Args:
 
 Returns:
   {
-    "slug": string,
+    "project_id": string,
     "event_name": string,
     "property": string,
     "period": string,

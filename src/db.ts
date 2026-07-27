@@ -59,7 +59,6 @@ export interface FrictionResult {
 
 export interface SnippetRow {
   url: string;
-  slug: string;
   workspace_id: string;
   project_id: string | null;
   created_at: number;
@@ -105,7 +104,6 @@ export interface BreakdownResult {
 }
 
 export const LIMITS = {
-  slug_max: 100,
   event_name_max: 100,
   tag_max: 100,
   entity_id_max: 200,
@@ -133,11 +131,14 @@ function normalizeUrl(url: string): string {
 // =============================================================================
 
 export async function migrate(): Promise<void> {
+  // slug a disparu du schema (migration terminee le 2026-07-27, voir CLAUDE.md). Une base
+  // existante l'a peut-etre encore : sa suppression (colonne + index) est un DDL destructif fait
+  // une seule fois, a la main, hors de cette fonction qui tourne a chaque demarrage — un DROP qui
+  // echouerait ici mettrait tout le service down, donc l'ingestion down.
   await sql`
     CREATE TABLE IF NOT EXISTS events (
       id BIGSERIAL PRIMARY KEY,
       workspace_id TEXT NOT NULL DEFAULT '',
-      slug TEXT NOT NULL,
       session_id TEXT NOT NULL,
       event_name TEXT NOT NULL,
       properties JSONB NOT NULL DEFAULT '{}',
@@ -148,36 +149,19 @@ export async function migrate(): Promise<void> {
   `;
   // Add workspace_id to existing tables that were created before this migration
   await sql`ALTER TABLE events ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''`;
-  // project_id : identite du client, resolue server-side par domaine (voir resolveByUrl). Devient
-  // la cle de segmentation de Mark a la place du slug (migration du 2026-07-27). Reste nullable
-  // pendant toute la transition : une ligne non attribuable ne doit jamais faire echouer un INSERT.
+  // project_id : identite du client, resolue server-side par domaine (voir resolveByUrl). Reste
+  // nullable : une ligne non attribuable part en quarantaine plutot que de faire echouer l'INSERT.
   await sql`ALTER TABLE events ADD COLUMN IF NOT EXISTS project_id TEXT`;
-  // slug relache AVANT que quoi que ce soit cesse d'en envoyer un. L'ordre compte : le tracker est
-  // servi en no-store, il se met a jour au premier chargement de page chez le client, et un INSERT
-  // qui echoue sur un event navigateur est une perte definitive (fire-and-forget, aucun retry).
-  await sql`ALTER TABLE events ALTER COLUMN slug DROP NOT NULL`;
-  // Index miroirs des index slug ci-dessous, pour que la bascule des lectures ne degrade rien.
   await sql`CREATE INDEX IF NOT EXISTS idx_workspace_project ON events(workspace_id, project_id)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_workspace_project_ts ON events(workspace_id, project_id, ts)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_project_event ON events(project_id, event_name)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_project_entity ON events(project_id, entity_id)`;
   await sql`CREATE INDEX IF NOT EXISTS idx_workspace ON events(workspace_id)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_workspace_slug ON events(workspace_id, slug)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_slug ON events(slug)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_slug_event ON events(slug, event_name)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_slug_ts ON events(slug, ts)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_slug_tag ON events(slug, tag)`;
-  await sql`CREATE INDEX IF NOT EXISTS idx_entity ON events(slug, entity_id)`;
-  // Predicat exact de summary / funnel / friction / breakdown : workspace_id = ? AND slug = ?
-  // AND ts >= ?. Aucun index existant ne couvre les trois colonnes ensemble (idx_workspace_slug
-  // s'arrete a slug, idx_slug_ts commence par slug sans workspace_id).
-  await sql`CREATE INDEX IF NOT EXISTS idx_workspace_slug_ts ON events(workspace_id, slug, ts)`;
   await sql`
     CREATE TABLE IF NOT EXISTS snippets (
       id BIGSERIAL PRIMARY KEY,
       workspace_id TEXT NOT NULL DEFAULT '',
       url TEXT NOT NULL,
-      slug TEXT NOT NULL,
       created_at BIGINT NOT NULL,
       UNIQUE(workspace_id, url)
     )
@@ -190,9 +174,8 @@ export async function migrate(): Promise<void> {
     EXCEPTION WHEN others THEN NULL;
     END $$
   `;
-  // project_id : dimension orthogonale au slug (voir en-tete du fichier), resolue par domaine
-  // (Origin/Referer) plutot qu'embarquee dans le snippet. Nullable : peuplee via POST /register,
-  // jamais devinee ni migree en masse.
+  // project_id : identite du client proprietaire de ce domaine, resolue par Origin/Referer plutot
+  // qu'embarquee dans le snippet. Nullable : peuplee via POST /register, jamais devinee.
   await sql`ALTER TABLE snippets ADD COLUMN IF NOT EXISTS project_id TEXT`;
   // resolveByUrl filtre sur la colonne url seule ; l'index unique existant est compose
   // (workspace_id, url) et ne couvre pas efficacement une recherche par url seule.
@@ -221,7 +204,6 @@ export async function migrate(): Promise<void> {
 
 export async function insertEvent(
   workspaceId: string,
-  slug: string | null,
   session_id: string,
   event_name: string,
   properties: Record<string, unknown> = {},
@@ -231,28 +213,9 @@ export async function insertEvent(
   projectId?: string | null
 ): Promise<void> {
   await sql`
-    INSERT INTO events (workspace_id, slug, session_id, event_name, properties, ts, tag, entity_id, project_id)
-    VALUES (${workspaceId}, ${slug}, ${session_id}, ${event_name}, ${properties as never}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null}, ${projectId ?? null})
+    INSERT INTO events (workspace_id, session_id, event_name, properties, ts, tag, entity_id, project_id)
+    VALUES (${workspaceId}, ${session_id}, ${event_name}, ${properties as never}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null}, ${projectId ?? null})
   `;
-}
-
-/**
- * Chemin legacy de l'ingestion : resout le proprietaire depuis le slug encore envoye par les
- * trackers deja poses chez les clients, quand l'en-tete Origin est absent ou inconnu.
- *
- * Ne resout que si le slug designe UN SEUL couple (workspace, projet) : deux workspaces peuvent
- * partager un slug (l'unicite de `snippets` porte sur (workspace_id, url), jamais sur le slug),
- * et dans ce cas on ne choisit pas. Retourne null plutot que de deviner — l'appelant met alors
- * l'evenement en quarantaine au lieu de l'attribuer au hasard.
- */
-export async function resolveBySlug(slug: string): Promise<{ workspace_id: string; project_id: string } | null> {
-  const rows = await sql`
-    SELECT DISTINCT workspace_id, project_id FROM snippets
-    WHERE slug = ${slug} AND project_id IS NOT NULL
-  `;
-  if (rows.length !== 1) return null;
-  const row = rows[0] as { workspace_id: string; project_id: string };
-  return { workspace_id: row.workspace_id, project_id: row.project_id };
 }
 
 /**
@@ -327,35 +290,6 @@ export async function listProjects(workspaceId: string): Promise<EventRow[]> {
     events: Number(r.events),
     last_event_ts: Number(r.last_event_ts),
   }));
-}
-
-/**
- * Pont de lecture, TEMPORAIRE (retire en meme temps que la colonne slug).
- *
- * Les routes /q/* prennent desormais un project_id. Pendant la fenetre ou la passerelle et le
- * dashboard envoient encore un slug, un identifiant non reconnu ne produirait pas une erreur mais
- * un resultat a zero : un dashboard qui affiche "aucune donnee" alors que le client en a est pire
- * qu'une panne visible, c'est l'echec vers le faux que le projet interdit.
- *
- * Traduit donc un slug en project_id quand c'est sans ambiguite, et rend l'entree inchangee
- * sinon. Ne devine jamais : plusieurs project_id pour un meme slug rend l'entree telle quelle.
- */
-export async function resolveReadTarget(workspaceId: string, param: string): Promise<string> {
-  const [asProject] = await sql`
-    SELECT 1 FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${param} LIMIT 1
-  `;
-  if (asProject) return param;
-
-  const rows = await sql`
-    SELECT DISTINCT project_id FROM events
-    WHERE workspace_id = ${workspaceId} AND slug = ${param} AND project_id IS NOT NULL
-  `;
-  if (rows.length === 1) {
-    const translated = (rows[0] as { project_id: string }).project_id;
-    console.warn(`[mark] lecture par slug "${param}" traduite en project_id "${translated}" (pont temporaire)`);
-    return translated;
-  }
-  return param;
 }
 
 export async function summary(workspaceId: string, projectId: string, days: number, tag?: string): Promise<SummaryResult> {
@@ -504,29 +438,23 @@ export async function journey(workspaceId: string, projectId: string, entity_id:
 // SNIPPETS
 // =============================================================================
 
-// projectId est optionnel : mark_snippet (usage self-hosted/MCP) ne le connait pas et n'en a pas
-// besoin (COALESCE conserve alors le project_id deja enregistre, s'il y en a un). POST /register
-// est le seul appelant qui le fournit explicitement (correctif dedie a la resolution par domaine).
 export async function registerSnippet(
   workspaceId: string,
   url: string,
-  slug: string,
-  projectId: string | null = null
+  projectId: string
 ): Promise<SnippetRow> {
   const normalized = normalizeUrl(url);
   const now = Date.now();
   const [row] = await sql`
-    INSERT INTO snippets (workspace_id, url, slug, project_id, created_at)
-    VALUES (${workspaceId}, ${normalized}, ${slug}, ${projectId}, ${now})
+    INSERT INTO snippets (workspace_id, url, project_id, created_at)
+    VALUES (${workspaceId}, ${normalized}, ${projectId}, ${now})
     ON CONFLICT(workspace_id, url) DO UPDATE
-      SET slug = EXCLUDED.slug,
-          project_id = COALESCE(EXCLUDED.project_id, snippets.project_id)
-    RETURNING workspace_id, url, slug, project_id, created_at
+      SET project_id = EXCLUDED.project_id
+    RETURNING workspace_id, url, project_id, created_at
   `;
   return {
     workspace_id: row.workspace_id as string,
     url: row.url as string,
-    slug: row.slug as string,
     project_id: (row.project_id ?? null) as string | null,
     created_at: Number(row.created_at),
   };
@@ -534,12 +462,11 @@ export async function registerSnippet(
 
 export async function resolveUrl(workspaceId: string, url: string): Promise<SnippetRow | null> {
   const normalized = normalizeUrl(url);
-  const [row] = await sql`SELECT workspace_id, url, slug, project_id, created_at FROM snippets WHERE workspace_id = ${workspaceId} AND url = ${normalized}`;
+  const [row] = await sql`SELECT workspace_id, url, project_id, created_at FROM snippets WHERE workspace_id = ${workspaceId} AND url = ${normalized}`;
   if (!row) return null;
   return {
     workspace_id: row.workspace_id as string,
     url: row.url as string,
-    slug: row.slug as string,
     project_id: (row.project_id ?? null) as string | null,
     created_at: Number(row.created_at),
   };
@@ -557,46 +484,24 @@ export async function resolveUrl(workspaceId: string, url: string): Promise<Snip
  *
  * Si plusieurs workspaces distincts partagent la meme URL normalisee (ne devrait pas arriver :
  * ce cas n'existe que si deux clients enregistrent litteralement le meme domaine), l'ambiguite
- * est reelle et la fonction echoue vers le vide (null) plutot que de deviner un proprietaire —
- * meme principe que workspacesForSlug.
+ * est reelle et la fonction echoue vers le vide (null) plutot que de deviner un proprietaire.
  */
-export async function resolveByUrl(url: string): Promise<{ workspace_id: string; project_id: string | null; slug: string | null } | null> {
+export async function resolveByUrl(url: string): Promise<{ workspace_id: string; project_id: string | null } | null> {
   const normalized = normalizeUrl(url);
-  const rows = await sql`SELECT workspace_id, project_id, slug FROM snippets WHERE url = ${normalized}`;
+  const rows = await sql`SELECT workspace_id, project_id FROM snippets WHERE url = ${normalized}`;
   if (rows.length === 0) return null;
   const workspaces = new Set(rows.map(r => r.workspace_id as string));
   if (workspaces.size !== 1) return null;
   const withProjectId = rows.find(r => r.project_id != null);
   const projectId = withProjectId ? (withProjectId.project_id as string) : null;
-  // Le slug enregistre pour ce domaine, pour que le tag <script> nu (sans query string) n'envoie
-  // pas tous les clients sous "default". On ne devine rien : plusieurs slugs enregistres sur le
-  // meme domaine est un cas legitime (plusieurs apps suivies separement) mais ambigu ici, donc on
-  // ne resout que s'il n'y en a qu'un seul. Sinon null, et l'appelant retombe sur "default".
-  const slugs = new Set(rows.map(r => r.slug as string).filter(Boolean));
-  const slug = slugs.size === 1 ? ([...slugs][0] as string) : null;
-  return { workspace_id: [...workspaces][0] as string, project_id: projectId, slug };
-}
-
-/**
- * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).
- *
- * La table snippets est unique sur (workspace_id, url) et NON sur le slug seul : deux
- * workspaces peuvent donc theoriquement partager un meme slug. On renvoie la liste complete
- * plutot qu'une valeur unique, pour que l'appelant puisse distinguer les trois cas (aucun
- * proprietaire connu, un seul, plusieurs) et refuser de choisir quand c'est ambigu. Deviner
- * serait exactement le "echec vers le faux" que le projet interdit.
- */
-export async function workspacesForSlug(slug: string): Promise<string[]> {
-  const rows = await sql`SELECT DISTINCT workspace_id FROM snippets WHERE slug = ${slug}`;
-  return rows.map(r => r.workspace_id as string);
+  return { workspace_id: [...workspaces][0] as string, project_id: projectId };
 }
 
 export async function listSnippets(workspaceId: string): Promise<SnippetRow[]> {
-  const rows = await sql`SELECT workspace_id, url, slug, project_id, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
+  const rows = await sql`SELECT workspace_id, url, project_id, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
   return rows.map(r => ({
     workspace_id: r.workspace_id as string,
     url: r.url as string,
-    slug: r.slug as string,
     project_id: (r.project_id ?? null) as string | null,
     created_at: Number(r.created_at),
   }));

@@ -7,7 +7,8 @@
  *
  * Regle cardinale : rien de ce qui identifie un client ne vient du corps de la requete. Cet
  * endpoint est public, et tout identifiant qu'il accepterait sur parole serait lisible dans le
- * code source de n'importe quelle page equipee.
+ * code source de n'importe quelle page equipee. Le seul chemin de resolution est desormais
+ * l'Origin de la requete (le chemin par slug, transitoire, a disparu avec la colonne).
  */
 
 export type Owner = { workspace_id: string; project_id: string };
@@ -15,8 +16,6 @@ export type Owner = { workspace_id: string; project_id: string };
 export type OwnerLookup = {
   /** Resout un proprietaire depuis l'origine du site appelant (table snippets). */
   byOrigin: (origin: string) => Promise<{ workspace_id: string; project_id: string | null } | null>;
-  /** Chemin de transition : resout depuis le slug encore envoye par les trackers deja poses. */
-  bySlug: (slug: string) => Promise<Owner | null>;
 };
 
 /**
@@ -47,24 +46,18 @@ export function siteOriginFrom(headers: { origin?: string; referer?: string }): 
  * null n'est PAS une erreur : l'appelant met alors l'evenement en quarantaine plutot que de le
  * rejeter (il serait perdu, l'appel du tracker etant fire-and-forget) ou de l'attribuer au hasard
  * (il polluerait les donnees d'un client). Un proprietaire sans project_id est traite comme non
- * resolu : la segmentation repose desormais entierement dessus.
+ * resolu : la segmentation repose entierement dessus.
  */
 export async function resolveEventOwner(
-  input: { origin?: string; referer?: string; slug?: string },
+  input: { origin?: string; referer?: string },
   lookup: OwnerLookup
 ): Promise<Owner | null> {
   const siteOrigin = siteOriginFrom(input);
+  if (!siteOrigin) return null;
 
-  if (siteOrigin) {
-    const byOrigin = await lookup.byOrigin(siteOrigin);
-    if (byOrigin?.project_id) {
-      return { workspace_id: byOrigin.workspace_id, project_id: byOrigin.project_id };
-    }
-  }
-
-  if (input.slug) {
-    const bySlug = await lookup.bySlug(input.slug);
-    if (bySlug?.project_id) return bySlug;
+  const byOrigin = await lookup.byOrigin(siteOrigin);
+  if (byOrigin?.project_id) {
+    return { workspace_id: byOrigin.workspace_id, project_id: byOrigin.project_id };
   }
 
   return null;

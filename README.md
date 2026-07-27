@@ -15,6 +15,8 @@ Mark has two surfaces:
 
 Data is stored in PostgreSQL. Every event is scoped to a `workspace_id` — a string you choose freely (e.g. `"local"`, `"my-project"`).
 
+`workspace_id` (and optionally `project_id`) are resolved server-side from the request's domain (`Origin`/`Referer`), matched against a `url` registered via `POST /register`. The `<script>` tag never embeds an identifier, so it never needs to change even if the tool changes internally. `slug` is a separate, optional dimension: it groups events within a workspace/project (e.g. several apps or pages tracked separately on the same domain), and defaults to `"default"` when omitted.
+
 ---
 
 ## Quick start

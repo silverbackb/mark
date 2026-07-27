@@ -59,6 +59,7 @@ export interface SnippetRow {
     url: string;
     slug: string;
     workspace_id: string;
+    project_id: string | null;
     created_at: number;
 }
 export interface JourneyEvent {
@@ -104,7 +105,7 @@ export declare const LIMITS: {
     property_string_max: number;
 };
 export declare function migrate(): Promise<void>;
-export declare function insertEvent(workspaceId: string, slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number): Promise<void>;
+export declare function insertEvent(workspaceId: string, slug: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number, projectId?: string | null): Promise<void>;
 export declare function purge(workspaceId: string, slug: string): Promise<{
     deleted: number;
 }>;
@@ -117,8 +118,27 @@ export declare function funnel(workspaceId: string, slug: string, steps: string[
 export declare function compare(workspaceId: string, slug: string, pivot: string, event: string | null, daysBefore: number, daysAfter: number, tag?: string): Promise<CompareResult>;
 export declare function friction(workspaceId: string, slug: string, days: number, tag?: string): Promise<FrictionResult>;
 export declare function journey(workspaceId: string, slug: string, entity_id: string, days: number): Promise<JourneyResult>;
-export declare function registerSnippet(workspaceId: string, url: string, slug: string): Promise<SnippetRow>;
+export declare function registerSnippet(workspaceId: string, url: string, slug: string, projectId?: string | null): Promise<SnippetRow>;
 export declare function resolveUrl(workspaceId: string, url: string): Promise<SnippetRow | null>;
+/**
+ * Resout workspace_id (et project_id) a partir d'une URL de site, pour GET /mark.js et
+ * l'ingestion. Contrairement a resolveUrl (qui verifie une URL DANS un workspace deja connu),
+ * ici le workspace lui-meme est inconnu au depart : c'est exactement le probleme que la
+ * resolution par domaine doit resoudre (voir CLAUDE.md, decision d'architecture).
+ *
+ * Reutilise normalizeUrl (pas de duplication). Contrat : le project_id est enregistre au niveau
+ * du domaine (POST /register est appele avec l'URL racine du site, pas une page precise) ; la
+ * recherche par URL normalisee exacte est donc suffisante et ne necessite pas de LIKE sur prefixe.
+ *
+ * Si plusieurs workspaces distincts partagent la meme URL normalisee (ne devrait pas arriver :
+ * ce cas n'existe que si deux clients enregistrent litteralement le meme domaine), l'ambiguite
+ * est reelle et la fonction echoue vers le vide (null) plutot que de deviner un proprietaire —
+ * meme principe que workspacesForSlug.
+ */
+export declare function resolveByUrl(url: string): Promise<{
+    workspace_id: string;
+    project_id: string | null;
+} | null>;
 /**
  * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).
  *

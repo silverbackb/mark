@@ -16,6 +16,7 @@ import {
   purgeOldEvents,
   registerSnippet,
   resolveUrl,
+  resolveByUrl,
   listSnippets,
   workspacesForSlug,
   recentEvents,
@@ -32,14 +33,15 @@ const RETENTION_DAYS = parseInt(process.env.MARK_RETENTION_DAYS ?? "365", 10);
 
 // --- HTTP tracker script ---
 
-function trackerScript(slug: string, wid: string): string {
+function trackerScript(slug: string, wid: string, projectId: string | null): string {
+  const projectIdLiteral = projectId ? `'${projectId}'` : "null";
   return `(function(){
   var k='_mark_sid';
   var sid=sessionStorage.getItem(k)||(Math.random().toString(36).slice(2)+Date.now().toString(36));
   sessionStorage.setItem(k,sid);
   var _eid=null,_tag=null;
   function send(evt,props){
-    var payload={workspace_id:'${wid}',slug:'${slug}',session_id:sid,event_name:evt,properties:props||{}};
+    var payload={workspace_id:'${wid}',slug:'${slug}',project_id:${projectIdLiteral},session_id:sid,event_name:evt,properties:props||{}};
     if(_eid) payload.entity_id=_eid;
     if(_tag) payload.tag=_tag;
     fetch('${PUBLIC_URL}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
@@ -87,8 +89,13 @@ function trackerScript(slug: string, wid: string): string {
 })();`;
 }
 
-function htmlSnippet(slug: string, wid: string): string {
-  return `<script async src="${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}"></script>`;
+// wid n'est plus embarque dans le snippet : le workspace (et le project_id) sont resolus
+// server-side par domaine (Origin/Referer, voir GET /mark.js et resolveByUrl dans db.ts). slug
+// reste un parametre optionnel de groupement intra-projet ; omis quand il vaut le defaut
+// ("default"), pour que le tag <script> n'ait jamais besoin d'etre retouche par le client.
+function htmlSnippet(slug?: string): string {
+  const query = slug && slug !== "default" ? `?slug=${encodeURIComponent(slug)}` : "";
+  return `<script async src="${PUBLIC_URL}/mark.js${query}"></script>`;
 }
 
 // Derive device / os / browser from the request User-Agent. Server-side so it
@@ -117,8 +124,9 @@ function parseUA(ua: string): { device: string; os: string; browser: string } {
 
 // GTM-compatible snippet: a bare <script src> inside a Custom HTML tag does not
 // execute reliably. GTM runs inline JS reliably, so we inject the script via DOM.
-function gtmSnippet(slug: string, wid: string): string {
-  const src = `${PUBLIC_URL}/mark.js?slug=${encodeURIComponent(slug)}&wid=${encodeURIComponent(wid)}`;
+function gtmSnippet(slug?: string): string {
+  const query = slug && slug !== "default" ? `?slug=${encodeURIComponent(slug)}` : "";
+  const src = `${PUBLIC_URL}/mark.js${query}`;
   return `<script>
   (function(){
     var s=document.createElement('script');
@@ -233,11 +241,51 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
 
   if (req.method === "GET" && url.pathname === "/mark.js") {
     const slug = url.searchParams.get("slug") ?? "default";
-    const wid = url.searchParams.get("wid") ?? "";
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
+
+    // Resolution par domaine (decision d'architecture SilverBackBase) : plus de wid en query
+    // param, jamais a retoucher cote client. Origin est envoye par le navigateur sur les
+    // requetes cross-origin (le cas normal ici, mark.silverbackbase.com != site du client) et
+    // n'inclut jamais de chemin. A defaut (navigateurs qui l'omettent), on retombe sur Referer
+    // et on n'en garde que l'origin (le chemin de la page visitee n'a pas a entrer en jeu :
+    // project_id est enregistre au niveau du domaine, pas par page).
+    const originHeader = (req.headers["origin"] as string | undefined) ?? "";
+    const refererHeader = (req.headers["referer"] as string | undefined) ?? "";
+    let siteOrigin = originHeader;
+    if (!siteOrigin && refererHeader) {
+      try {
+        siteOrigin = new URL(refererHeader).origin;
+      } catch {
+        siteOrigin = "";
+      }
+    }
+
+    if (!siteOrigin) {
+      // Ni Origin ni Referer exploitable : on ne peut pas savoir a qui appartient ce domaine.
+      // Script vide et inoffensif plutot qu'une erreur bruyante cote navigateur client.
+      res.writeHead(200);
+      res.end("/* mark: no Origin/Referer header, tracking disabled */");
+      return;
+    }
+
+    let resolved: { workspace_id: string; project_id: string | null } | null = null;
+    try {
+      resolved = await resolveByUrl(siteOrigin);
+    } catch (error) {
+      console.error(`[mark] resolveByUrl a echoue pour l'origine "${siteOrigin}":`, error);
+    }
+
+    if (!resolved) {
+      // Domaine inconnu de la table snippets (jamais enregistre via POST /register) : meme
+      // reponse inoffensive, pas d'erreur qui casserait la page du client.
+      res.writeHead(200);
+      res.end("/* mark: domain not registered, tracking disabled */");
+      return;
+    }
+
     res.writeHead(200);
-    res.end(trackerScript(slug, wid));
+    res.end(trackerScript(slug, resolved.workspace_id, resolved.project_id));
     return;
   }
 
@@ -261,9 +309,9 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       const parsed = JSON.parse(body) as {
         workspace_id?: string; slug?: string; session_id?: string; event_name?: string;
         properties?: Record<string, unknown>;
-        tag?: string; entity_id?: string; ts?: number;
+        tag?: string; entity_id?: string; ts?: number; project_id?: string;
       };
-      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts } = parsed;
+      const { workspace_id, slug, session_id, event_name, properties, tag, entity_id, ts, project_id } = parsed;
       if (!workspace_id || !slug || !session_id || !event_name) {
         json(res, { error: "Missing required fields: workspace_id, slug, session_id, event_name" }, 400);
         return;
@@ -351,7 +399,8 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       const enriched = clampProperties({ ...uaProps, ...(properties ?? {}) });
       // effectiveWorkspaceId : l'evenement est ecrit chez le proprietaire reel du slug
       // (correctif C1), pas chez le workspace annonce dans le corps de la requete.
-      await insertEvent(effectiveWorkspaceId, slug, session_id, event_name, enriched, tag, entity_id, ts);
+      // project_id : resolu server-side sur GET /mark.js (jamais devine ici), transmis tel quel.
+      await insertEvent(effectiveWorkspaceId, slug, session_id, event_name, enriched, tag, entity_id, ts, project_id ?? null);
       json(res, { ok: true });
     } catch {
       json(res, { error: "Invalid JSON" }, 400);
@@ -381,6 +430,42 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     return;
   }
   const wid = widDecision.workspaceId;
+
+  // Enregistre le project_id d'un domaine pour le workspace authentifie (wid resolu depuis le
+  // header, jamais depuis le corps — meme principe que le reste de ce bloc). Appele par la
+  // passerelle silverbackbase-mcp, typiquement avec l'URL racine du site : project_id est une
+  // notion de domaine, pas de page. Ne remplace jamais un slug deja enregistre pour ce domaine :
+  // si l'appelant du snippet a deja pose un slug custom sur cette URL, il est conserve tel quel.
+  if (req.method === "POST" && url.pathname === "/register") {
+    let body: string;
+    try {
+      body = await readBoundedBody(req);
+    } catch (e) {
+      if (e instanceof BodyTooLargeError) {
+        json(res, { error: "Payload too large" }, 413);
+      } else if (e instanceof BodyTimeoutError) {
+        json(res, { error: "Request timeout" }, 408);
+      } else {
+        json(res, { error: "Invalid request" }, 400);
+      }
+      return;
+    }
+    try {
+      const parsed = JSON.parse(body) as { project_id?: string; url?: string };
+      const { project_id, url: siteUrl } = parsed;
+      if (!project_id || !siteUrl) {
+        json(res, { error: "Missing required fields: project_id, url" }, 400);
+        return;
+      }
+      const existing = await resolveUrl(wid, siteUrl);
+      const slug = existing?.slug ?? "default";
+      const reg = await registerSnippet(wid, siteUrl, slug, project_id);
+      json(res, { ok: true, project_id: reg.project_id, url: reg.url });
+    } catch {
+      json(res, { error: "Invalid JSON" }, 400);
+    }
+    return;
+  }
 
   if (req.method === "GET" && url.pathname === "/q/list") {
     json(res, await listSlugs(wid));
@@ -479,6 +564,11 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
           method: "POST", path: "/e",
           body: { slug: "string", session_id: "string", event_name: "string", properties: "object?", tag: "string?", entity_id: "string?", ts: "number? (unix ms)" },
           description: "Ingest an event",
+        },
+        {
+          method: "POST", path: "/register",
+          body: { project_id: "string", url: "string (domain root, resolved server-side per workspace from x-workspace-id)" },
+          description: "Register the project_id for a domain (authenticated, cloud mode only)",
         },
         { method: "GET", path: "/logs/recent", params: { limit: "number (default 50, max 200)" }, description: "Recent events across all slugs" },
         { method: "GET", path: "/q/list", description: "List active slugs" },
@@ -589,8 +679,8 @@ Returns: { snippet, snippet_gtm, ingestion_url, usage, registered? }
     },
     async ({ slug, url }) => {
       const result: Record<string, unknown> = {
-        snippet: htmlSnippet(slug, MCP_WORKSPACE_ID),
-        snippet_gtm: gtmSnippet(slug, MCP_WORKSPACE_ID),
+        snippet: htmlSnippet(slug),
+        snippet_gtm: gtmSnippet(slug),
         ingestion_url: `${PUBLIC_URL}/e`,
         usage: {
           track: `markjs.track('event_name', { optional: 'props' })`,

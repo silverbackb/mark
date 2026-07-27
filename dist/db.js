@@ -40,6 +40,10 @@ export async function migrate() {
   `;
     // Add workspace_id to existing tables that were created before this migration
     await sql `ALTER TABLE events ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT ''`;
+    // project_id : resolu server-side par domaine (voir resolveByUrl / GET mark.js), stocke tel
+    // quel a l'ingestion. Nullable : le peuplement des lignes existantes se fait via POST /register,
+    // jamais par une migration SQL directe.
+    await sql `ALTER TABLE events ADD COLUMN IF NOT EXISTS project_id TEXT`;
     await sql `CREATE INDEX IF NOT EXISTS idx_workspace ON events(workspace_id)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_workspace_slug ON events(workspace_id, slug)`;
     await sql `CREATE INDEX IF NOT EXISTS idx_slug ON events(slug)`;
@@ -69,14 +73,21 @@ export async function migrate() {
     EXCEPTION WHEN others THEN NULL;
     END $$
   `;
+    // project_id : dimension orthogonale au slug (voir en-tete du fichier), resolue par domaine
+    // (Origin/Referer) plutot qu'embarquee dans le snippet. Nullable : peuplee via POST /register,
+    // jamais devinee ni migree en masse.
+    await sql `ALTER TABLE snippets ADD COLUMN IF NOT EXISTS project_id TEXT`;
+    // resolveByUrl filtre sur la colonne url seule ; l'index unique existant est compose
+    // (workspace_id, url) et ne couvre pas efficacement une recherche par url seule.
+    await sql `CREATE INDEX IF NOT EXISTS idx_snippets_url ON snippets(url)`;
 }
 // =============================================================================
 // MUTATIONS
 // =============================================================================
-export async function insertEvent(workspaceId, slug, session_id, event_name, properties = {}, tag, entity_id, ts) {
+export async function insertEvent(workspaceId, slug, session_id, event_name, properties = {}, tag, entity_id, ts, projectId) {
     await sql `
-    INSERT INTO events (workspace_id, slug, session_id, event_name, properties, ts, tag, entity_id)
-    VALUES (${workspaceId}, ${slug}, ${session_id}, ${event_name}, ${properties}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null})
+    INSERT INTO events (workspace_id, slug, session_id, event_name, properties, ts, tag, entity_id, project_id)
+    VALUES (${workspaceId}, ${slug}, ${session_id}, ${event_name}, ${properties}, ${ts ?? Date.now()}, ${tag ?? null}, ${entity_id ?? null}, ${projectId ?? null})
   `;
 }
 export async function purge(workspaceId, slug) {
@@ -272,21 +283,67 @@ export async function journey(workspaceId, slug, entity_id, days) {
 // =============================================================================
 // SNIPPETS
 // =============================================================================
-export async function registerSnippet(workspaceId, url, slug) {
+// projectId est optionnel : mark_snippet (usage self-hosted/MCP) ne le connait pas et n'en a pas
+// besoin (COALESCE conserve alors le project_id deja enregistre, s'il y en a un). POST /register
+// est le seul appelant qui le fournit explicitement (correctif dedie a la resolution par domaine).
+export async function registerSnippet(workspaceId, url, slug, projectId = null) {
     const normalized = normalizeUrl(url);
     const now = Date.now();
-    await sql `
-    INSERT INTO snippets (workspace_id, url, slug, created_at) VALUES (${workspaceId}, ${normalized}, ${slug}, ${now})
-    ON CONFLICT(workspace_id, url) DO UPDATE SET slug = EXCLUDED.slug
+    const [row] = await sql `
+    INSERT INTO snippets (workspace_id, url, slug, project_id, created_at)
+    VALUES (${workspaceId}, ${normalized}, ${slug}, ${projectId}, ${now})
+    ON CONFLICT(workspace_id, url) DO UPDATE
+      SET slug = EXCLUDED.slug,
+          project_id = COALESCE(EXCLUDED.project_id, snippets.project_id)
+    RETURNING workspace_id, url, slug, project_id, created_at
   `;
-    return { workspace_id: workspaceId, url: normalized, slug, created_at: now };
+    return {
+        workspace_id: row.workspace_id,
+        url: row.url,
+        slug: row.slug,
+        project_id: (row.project_id ?? null),
+        created_at: Number(row.created_at),
+    };
 }
 export async function resolveUrl(workspaceId, url) {
     const normalized = normalizeUrl(url);
-    const [row] = await sql `SELECT workspace_id, url, slug, created_at FROM snippets WHERE workspace_id = ${workspaceId} AND url = ${normalized}`;
+    const [row] = await sql `SELECT workspace_id, url, slug, project_id, created_at FROM snippets WHERE workspace_id = ${workspaceId} AND url = ${normalized}`;
     if (!row)
         return null;
-    return { workspace_id: row.workspace_id, url: row.url, slug: row.slug, created_at: Number(row.created_at) };
+    return {
+        workspace_id: row.workspace_id,
+        url: row.url,
+        slug: row.slug,
+        project_id: (row.project_id ?? null),
+        created_at: Number(row.created_at),
+    };
+}
+/**
+ * Resout workspace_id (et project_id) a partir d'une URL de site, pour GET /mark.js et
+ * l'ingestion. Contrairement a resolveUrl (qui verifie une URL DANS un workspace deja connu),
+ * ici le workspace lui-meme est inconnu au depart : c'est exactement le probleme que la
+ * resolution par domaine doit resoudre (voir CLAUDE.md, decision d'architecture).
+ *
+ * Reutilise normalizeUrl (pas de duplication). Contrat : le project_id est enregistre au niveau
+ * du domaine (POST /register est appele avec l'URL racine du site, pas une page precise) ; la
+ * recherche par URL normalisee exacte est donc suffisante et ne necessite pas de LIKE sur prefixe.
+ *
+ * Si plusieurs workspaces distincts partagent la meme URL normalisee (ne devrait pas arriver :
+ * ce cas n'existe que si deux clients enregistrent litteralement le meme domaine), l'ambiguite
+ * est reelle et la fonction echoue vers le vide (null) plutot que de deviner un proprietaire —
+ * meme principe que workspacesForSlug.
+ */
+export async function resolveByUrl(url) {
+    const normalized = normalizeUrl(url);
+    const rows = await sql `SELECT workspace_id, project_id FROM snippets WHERE url = ${normalized}`;
+    if (rows.length === 0)
+        return null;
+    const workspaces = new Set(rows.map(r => r.workspace_id));
+    if (workspaces.size !== 1)
+        return null;
+    const withProjectId = rows.find(r => r.project_id != null);
+    const projectId = withProjectId ? withProjectId.project_id : null;
+    return { workspace_id: [...workspaces][0], project_id: projectId };
 }
 /**
  * Retourne les workspaces distincts ayant enregistre ce slug (correctif C1).
@@ -302,8 +359,14 @@ export async function workspacesForSlug(slug) {
     return rows.map(r => r.workspace_id);
 }
 export async function listSnippets(workspaceId) {
-    const rows = await sql `SELECT workspace_id, url, slug, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
-    return rows.map(r => ({ workspace_id: r.workspace_id, url: r.url, slug: r.slug, created_at: Number(r.created_at) }));
+    const rows = await sql `SELECT workspace_id, url, slug, project_id, created_at FROM snippets WHERE workspace_id = ${workspaceId} ORDER BY created_at DESC`;
+    return rows.map(r => ({
+        workspace_id: r.workspace_id,
+        url: r.url,
+        slug: r.slug,
+        project_id: (r.project_id ?? null),
+        created_at: Number(r.created_at),
+    }));
 }
 export async function breakdown(workspaceId, slug, event_name, property, days, tag, limit = 30) {
     const since = Date.now() - days * 86_400_000;

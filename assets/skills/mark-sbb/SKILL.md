@@ -18,7 +18,7 @@ Mark runs on `http://localhost:7331`. Check it's alive before any operation: `GE
 
 ## Instrument an app (3 steps)
 
-1. Call `mark_snippet("my-slug")` — get the `<script>` tag
+1. Call `mark_snippet(project_id: "my-client", url: "https://my-client.example")` — registers the domain and returns the universal `<script>` tag. The tag is identical for every client and never needs to change: Mark resolves the client from the domain of the page that loads it.
 2. Paste it before `</body>` in the HTML
 3. Add `window.markjs.track('event_name', { optional: 'props' })` at key moments
 
@@ -41,17 +41,21 @@ Both `identify` and `setTag` persist for the browser session — call once, appl
 
 ## Tools reference
 
+Every tool below takes `project_id` as its first argument — the same identifier you passed to `mark_snippet`.
+
 | Tool | What it does | Key optional params |
 |------|-------------|---------------------|
-| `mark_snippet` | Returns `<script>` tag + tracker usage | slug |
+| `mark_snippet` | Registers a domain and returns the universal `<script>` tag | url |
+| `mark_resolve` | Looks up the client already registered for a URL | — |
+| `mark_list_snippets` | Lists all registered URL → client mappings | — |
 | `mark_ingest` | Injects a synthetic event from the agent | tag, entity_id, ts (Unix ms for backdating) |
-| `mark_list` | Lists all active slugs with counts | — |
+| `mark_list` | Lists all active clients with counts | — |
 | `mark_summary` | Overview: sessions, events, top events | days, **tag** |
 | `mark_funnel` | Conversion through ordered steps | days, **tag** |
 | `mark_compare` | Before vs after a date pivot | event, days_before, days_after, **tag** |
 | `mark_friction` | Where sessions stop progressing | days, **tag** |
 | `mark_journey` | Full event sequence for one entity | days |
-| `mark_purge` | Delete all data for a slug | — |
+| `mark_purge` | Delete all data for a client | — |
 
 ## Segmentation with `tag`
 
@@ -63,8 +67,8 @@ Use `tag` to split events into groups — for A/B tests, device types, user tier
 
 **Reading segmented data:**
 ```
-mark_funnel("slug", ["step_1", "step_2", "purchase"], 30, "variant-a")
-mark_funnel("slug", ["step_1", "step_2", "purchase"], 30, "variant-b")
+mark_funnel("my-client", ["step_1", "step_2", "purchase"], 30, "variant-a")
+mark_funnel("my-client", ["step_1", "step_2", "purchase"], 30, "variant-b")
 // Compare rates[] to evaluate the variant impact
 ```
 
@@ -81,12 +85,12 @@ markjs.identify('lead-456')  // all events from this session are linked to lead-
 
 **Set it via agent:**
 ```
-mark_ingest("slug", "session-abc", "purchase", {plan:"pro"}, tag=null, entity_id="lead-456")
+mark_ingest("my-client", "session-abc", "purchase", {plan:"pro"}, tag=null, entity_id="lead-456")
 ```
 
 **Read the journey:**
 ```
-mark_journey("slug", "lead-456", 30)
+mark_journey("my-client", "lead-456", 30)
 → { total_events: 7, events: [{ ts, event_name, session_id, properties, tag }] }
 ```
 
@@ -96,7 +100,7 @@ Use `mark_journey` to debug a specific user's path or to correlate with a CRM re
 
 To replay historical data or seed realistic test events at specific timestamps:
 ```
-mark_ingest("slug", "session-1", "signup_start", {}, ts=1748736000000)
+mark_ingest("my-client", "session-1", "signup_start", {}, ts=1748736000000)
 ```
 
 `ts` is Unix milliseconds. Omit to use current time.
@@ -105,20 +109,20 @@ mark_ingest("slug", "session-1", "signup_start", {}, ts=1748736000000)
 
 **`mark_funnel`** — pass steps in expected completion order:
 ```
-mark_funnel("slug", ["page_view", "signup_start", "signup_complete"])
+mark_funnel("my-client", ["page_view", "signup_start", "signup_complete"])
 → { drop_at: "signup_start", rates: [1.0, 0.43, 0.31] }
 ```
 `drop_at` is where to focus. Rate below 0.5 at step 2+ is a friction signal worth investigating.
 
 **`mark_friction`** — use when you don't know which step is the problem:
 ```
-mark_friction("slug") → ordered by sequence, shows sessions_stopped_here per event
+mark_friction("my-client") → ordered by sequence, shows sessions_stopped_here per event
 ```
 Start here for open-ended "why are users dropping off?" questions.
 
 **`mark_compare`** — measure impact of a change:
 ```
-mark_compare("slug", pivot="2026-06-01", event="purchase")
+mark_compare("my-client", pivot="2026-06-01", event="purchase")
 → { before: { completions: 48 }, after: { completions: 71 }, delta: "+47.9%" }
 ```
 Always specify `event` when measuring a specific completion. Without it, compares total sessions.
@@ -134,7 +138,6 @@ When both are active: use Trail for attribution, Mark for behavior. Pass the Tra
 
 | Field | Max |
 |-------|-----|
-| slug | 100 chars |
 | event_name | 100 chars |
 | tag | 100 chars |
 | entity_id | 200 chars |
@@ -143,8 +146,8 @@ When both are active: use Trail for attribution, Mark for behavior. Pass the Tra
 
 ## Rules
 
-- Always call `mark_list` first if you don't know what slugs exist
+- Always call `mark_list` first if you don't know what clients already have data
 - Use `mark_ingest` with realistic `session_id`s to seed test events before real users arrive
 - `mark_purge` is irreversible — confirm with user before calling it
-- HTTP endpoints (`/q/summary/:slug`, `/q/funnel/:slug?steps=a,b,c&tag=variant-a`, etc.) work for any LLM with function calling
+- HTTP endpoints (`/q/summary/:project_id`, `/q/funnel/:project_id?steps=a,b,c&tag=variant-a`, etc.) work for any LLM with function calling
 - `GET /q/schema` returns the full endpoint list with params and limits

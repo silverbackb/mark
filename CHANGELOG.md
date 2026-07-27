@@ -1,3 +1,36 @@
+## v0.2.0 — 2026-07-27
+
+### Rupture d'API — `slug` supprimé, `project_id` est l'identifiant
+
+Mark identifiait ses clients par un `slug` choisi librement à l'installation, sans lien fiable
+avec le domaine réel. Il identifie désormais chaque client par `project_id`, résolu server-side
+depuis le domaine de la page (`Origin`/`Referer`), au même titre que le workspace.
+
+**Ce qui casse :**
+- Le tag `<script>` ne prend plus de paramètre `?slug=` ni `wid=` : il est strictement identique
+  pour tous les clients (`<script async src=".../mark.js"></script>`), et se met à jour tout seul
+  (`Cache-Control: no-store`).
+- Les 7 outils MCP de lecture (`mark_summary`, `mark_funnel`, `mark_compare`, `mark_friction`,
+  `mark_journey`, `mark_breakdown`, `mark_purge`) prennent `project_id` au lieu de `slug`.
+- Les routes `/q/*` prennent `:project_id` dans leur chemin au lieu de `:slug`.
+- `mark_snippet` ne prend plus `slug` : `project_id` (obligatoire) + `url` (optionnel, enregistre
+  le domaine, condition pour que l'ingestion sache attribuer les événements).
+- La colonne `slug` est supprimée des tables `events` et `snippets`. Une base existante migre
+  automatiquement au démarrage jusqu'à la v0.1.x ; passer directement à la v0.2.0 sur une base
+  jamais migrée créera le schéma sans cette colonne, sans étape supplémentaire.
+
+**Sécurité :** `POST /e` ne fait plus jamais confiance à un `workspace_id` ou `project_id` fourni
+dans le corps de la requête publique — les deux sont résolus depuis le domaine appelant. Un
+événement dont le domaine n'est pas enregistré part dans une table de quarantaine (rejouable une
+fois `mark_snippet`/`POST /register` appelé) plutôt que d'être perdu ou mal attribué.
+
+**Self-hosted :** si la requête n'a ni `Origin` ni `Referer` exploitable (appel manuel, script de
+test, pas un navigateur), le serveur retombe sur le `project_id` fourni dans le corps — un seul
+opérateur possible sur sa propre instance, pas de registre multi-tenant à protéger. Ce repli ne
+s'applique jamais quand `MARK_INTERNAL_SECRET` est configuré (mode cloud).
+
+---
+
 ## v0.1.15 — 2026-07-07
 
 ### Corrigé

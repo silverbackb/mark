@@ -1,4 +1,4 @@
-# @silverbackbase/mark · v0.1.13
+# @silverbackbase/mark · v0.2.0
 
 Headless micro-analytics for AI agents. A one-line snippet on your site, and your agent reads visitor behavior directly — no dashboard, no UI.
 
@@ -13,9 +13,9 @@ Mark has two surfaces:
 - **HTTP server** — accepts events from any browser via a one-line JS snippet, and exposes query endpoints for agents or any LLM with function calling
 - **MCP stdio** — exposes tools for Claude Code, Codex CLI, and Claude Desktop
 
-Data is stored in PostgreSQL. Every event is scoped to a `workspace_id` — a string you choose freely (e.g. `"local"`, `"my-project"`).
+Data is stored in PostgreSQL. Every event is scoped to a `workspace_id` — a string you choose freely (e.g. `"local"`, `"my-project"`) — and to a `project_id`, the client or site this event belongs to.
 
-`workspace_id` (and optionally `project_id`) are resolved server-side from the request's domain (`Origin`/`Referer`), matched against a `url` registered via `POST /register`. The `<script>` tag never embeds an identifier, so it never needs to change even if the tool changes internally. `slug` is a separate, optional dimension: it groups events within a workspace/project (e.g. several apps or pages tracked separately on the same domain), and defaults to `"default"` when omitted.
+Both are resolved server-side from the request's domain (`Origin`/`Referer`), matched against a `url` registered via `POST /register` (or the `mark_snippet` MCP tool, which calls it for you). The `<script>` tag never embeds an identifier: it is strictly identical for every client and never needs to change, even if you rename or re-register a site.
 
 ---
 
@@ -41,15 +41,21 @@ mark
 
 The server starts on the port defined by `PORT` (default 7331). Migrations run automatically on startup.
 
-### 3. Add the snippet to your site
+### 3. Register your site and add the snippet
 
-Paste before `</body>` on every page:
+Ask your agent (or call the tool directly):
 
-```html
-<script async src="https://your-instance.com/mark.js?slug=my-site&wid=local"></script>
+```
+mark_snippet(project_id: "my-site", url: "https://my-site.example")
 ```
 
-`slug` identifies the site. `wid` is your workspace ID — use any consistent string.
+This registers the domain → project_id mapping and returns the tag. Paste it before `</body>` on every page:
+
+```html
+<script async src="https://your-instance.com/mark.js"></script>
+```
+
+The tag is universal — no parameters, works identically pasted directly or injected via a GTM Custom HTML tag.
 
 Once loaded, auto-tracking activates: `page_view`, clicks on buttons/links, `tel_click` (`tel:` links), `form_submit`, `page_exit`, and `scroll_depth` at 25/50/75/100%. Every ingested event is also enriched server-side with `device` (mobile/tablet/desktop), `os` and `browser`, derived from the request User-Agent — group by them with `mark_breakdown`. Custom events:
 
@@ -75,48 +81,51 @@ mark_compare("my-site", pivot="2026-06-01", event="form_submit")
 // → { before: { completions: 48 }, after: { completions: 71 }, delta: "+47.9%" }
 ```
 
+(`"my-site"` above is shorthand for the `project_id` you passed to `mark_snippet` — every tool below takes `project_id` as its first argument.)
+
 ---
 
 ## MCP tools
 
 | Tool | Description |
 |------|-------------|
-| `mark_snippet` | Returns the `<script>` tag to embed on the site |
+| `mark_snippet` | Registers a site's domain and returns the universal `<script>` tag |
+| `mark_resolve` | Looks up the client already registered for a URL |
+| `mark_list_snippets` | Lists all registered URL → client mappings |
 | `mark_ingest` | Injects a synthetic event from the agent (testing, seeding) |
-| `mark_list` | Lists all active slugs with session and event counts |
+| `mark_list` | Lists all active clients with session and event counts |
 | `mark_summary` | Overview: sessions, events, top events over N days |
 | `mark_funnel` | Conversion rate through an ordered list of events |
 | `mark_compare` | Behavior before vs after a date pivot |
 | `mark_friction` | Where sessions stop progressing |
 | `mark_journey` | Full event history for a specific entity |
 | `mark_breakdown` | Group an event by a property value — e.g. `page_view` by `url` to see top pages |
-| `mark_purge` | Delete all data for a slug (irreversible) |
+| `mark_purge` | Delete all data for a client (irreversible) |
 
 ---
 
 ## HTTP endpoints
 
 ```
-POST /e                                  Ingest an event (open — called from browsers)
-GET  /mark.js?slug=:slug&wid=:wid        Serve the browser tracker script
-GET  /health                             Health check
-GET  /logs/recent?limit=50               Recent events
-GET  /q/list                             List active slugs
-GET  /q/summary/:slug?days=7             Session and event overview
-GET  /q/funnel/:slug?steps=a,b,c         Funnel conversion by step
-GET  /q/compare/:slug?pivot=ISO          Before vs after comparison
-GET  /q/friction/:slug                   Drop-off points
-GET  /q/journey/:slug?entity_id=ID       Entity event history
-GET  /q/breakdown/:slug?event=&property= Group event by property value
-GET  /q/schema                           Full endpoint schema
+POST /e                                        Ingest an event (open — called from browsers)
+GET  /mark.js                                  Serve the browser tracker script (universal, no params)
+GET  /health                                   Health check
+GET  /logs/recent?limit=50&project_id=         Recent events, optionally scoped to one client
+GET  /q/list                                   List active clients
+GET  /q/summary/:project_id?days=7             Session and event overview
+GET  /q/funnel/:project_id?steps=a,b,c         Funnel conversion by step
+GET  /q/compare/:project_id?pivot=ISO          Before vs after comparison
+GET  /q/friction/:project_id                   Drop-off points
+GET  /q/journey/:project_id?entity_id=ID       Entity event history
+GET  /q/breakdown/:project_id?event=&property= Group event by property value
+GET  /q/schema                                 Full endpoint schema
+POST /register                                 Register a domain → project_id mapping (authenticated)
 ```
 
 ### Event ingestion payload (`POST /e`)
 
 ```json
 {
-  "workspace_id": "local",
-  "slug": "my-site",
   "session_id": "abc123",
   "event_name": "signup_start",
   "properties": { "optional": "metadata" },
@@ -125,7 +134,9 @@ GET  /q/schema                           Full endpoint schema
 }
 ```
 
-`workspace_id` is required — all data is scoped by it.
+The tracker sends nothing that identifies who the event belongs to: `workspace_id` and `project_id` are resolved server-side from the request's `Origin`/`Referer` header, matched against the domain registered via `mark_snippet`/`POST /register`. An event from an unregistered domain is held in a quarantine table rather than dropped or misattributed — register the domain and future events resolve correctly.
+
+Self-hosted only: if the request has no usable `Origin`/`Referer` (a manual `curl` or test script, not a browser), the server falls back to trusting `project_id` from the body directly — there is no multi-tenant registry or billing to protect on a single self-hosted instance.
 
 ---
 
@@ -137,7 +148,7 @@ GET  /q/schema                           Full endpoint schema
 | `PORT` | No | HTTP server port (default 7331) |
 | `MARK_PUBLIC_URL` | No | Public base URL for snippet generation (default `http://localhost:PORT`) |
 | `MARK_WORKSPACE_ID` | No | Workspace ID used by MCP stdio tools (default `"local"`) |
-| `MARK_INTERNAL_SECRET` | No | If set, query endpoints (`/q/*`, `/logs/*`) require `x-internal-secret: <value>`. Ingestion (`POST /e`) and `/mark.js` remain open. |
+| `MARK_INTERNAL_SECRET` | No | If set, query endpoints (`/q/*`, `/logs/*`, `/register`) require `x-internal-secret: <value>`, and the server treats itself as running in cloud mode (no self-hosted fallback on `POST /e`). Ingestion (`POST /e`) and `/mark.js` remain open either way. |
 
 ---
 

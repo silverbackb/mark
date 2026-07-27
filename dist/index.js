@@ -4,7 +4,7 @@ import { createServer } from "node:http";
 import { z } from "zod";
 import { migrate, insertEvent, listProjects, summary, funnel, compare, friction, journey, breakdown, purge, purgeOldEvents, registerSnippet, resolveUrl, resolveByUrl, insertUnresolvedEvent, listSnippets, recentEvents, LIMITS, } from "./db.js";
 import { resolveQueryWorkspaceId } from "./workspace-guard.js";
-import { resolveEventOwner, siteOriginFrom } from "./event-owner.js";
+import { resolveEventOwner, siteOriginFrom, decidePostEvent } from "./event-owner.js";
 const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
@@ -292,57 +292,55 @@ async function handleRequestAsync(req, res) {
             // d'injecter des evenements chez un client ET de declencher son debit jusqu'a epuiser son
             // solde. C'est le correctif C1, etendu au project_id qui est desormais la cle de segmentation.
             //
-            // Seul chemin de resolution : Origin (fallback Referer) -> table snippets. Origin est un
-            // en-tete interdit d'ecriture pour du JS de page, le tracker ne peut pas le falsifier. Sans
-            // resolution -> quarantaine (202), sans ecriture ni debit — jamais de repli qui accepterait
-            // une valeur du corps (c'etait exactement la porte laissee ouverte par l'ancien C1).
+            // Origin (fallback Referer) -> table snippets EST tente en premier, cloud comme self-hosted :
+            // le tracker navigateur (GET /mark.js) exige deja qu'un domaine soit enregistre avant de
+            // servir un script actif (voir resolveByUrl plus bas), et cette resolution fonctionne
+            // identiquement dans les deux modes. La coupure cloud/self-hosted n'intervient que sur ce
+            // qu'on fait quand Origin echoue : le cloud (multi-tenant, facture) n'a alors aucun repli et
+            // met en quarantaine ; le self-hosted (une seule instance, un seul operateur, pas de
+            // facturation) peut faire confiance au project_id du corps — utile pour un appel manuel
+            // (curl, script de test) sans navigateur donc sans Origin. Rater cet ordre serait une
+            // regression concrete : depuis que le tracker n'embarque plus de project_id (phase
+            // precedente de cette migration), un self-hosted qui sauterait la resolution par Origin
+            // perdrait le project_id de TOUS ses evenements navigateur, alors que cette resolution
+            // aurait pu les retrouver.
             //
-            // Mode self-hosted : lu depuis CLOUD_MODE, la CONFIGURATION du serveur (secret interne
-            // pose par l'operateur), jamais depuis le corps de la requete. Avant ce correctif, ce mode
-            // etait detecte via `workspace_id === "local"` fourni par le corps : sur le service cloud,
+            // Mode self-hosted lu depuis CLOUD_MODE, la CONFIGURATION du serveur (secret interne pose
+            // par l'operateur), jamais depuis le corps de la requete. Avant ce correctif, ce mode etait
+            // detecte via `workspace_id === "local"` fourni par le corps : sur le service cloud,
             // n'importe qui pouvait donc envoyer {workspace_id:"local"} pour contourner a la fois la
-            // resolution par Origin et le debit de facturation — un trou de securite independant du
-            // slug, trouve en finalisant cette migration. En self-hosted, il n'y a ni registre
-            // multi-tenant ni facturation a proteger : le project_id du corps y reste digne de
-            // confiance (l'operateur est le seul appelant possible de sa propre instance).
-            const isSelfHosted = !CLOUD_MODE;
-            let effectiveWorkspaceId;
-            let effectiveProjectId;
-            if (isSelfHosted) {
-                effectiveWorkspaceId = MCP_WORKSPACE_ID;
-                effectiveProjectId = parsed.project_id ?? null;
+            // resolution par Origin et le debit de facturation.
+            const headers = {
+                origin: req.headers["origin"],
+                referer: req.headers["referer"],
+            };
+            const siteOrigin = siteOriginFrom(headers);
+            let owner = null;
+            try {
+                owner = await resolveEventOwner(headers, { byOrigin: resolveByUrl });
             }
-            else {
-                const headers = {
-                    origin: req.headers["origin"],
-                    referer: req.headers["referer"],
-                };
-                const siteOrigin = siteOriginFrom(headers);
-                let owner = null;
+            catch (error) {
+                console.error(`[mark] resolution du proprietaire impossible (origin "${siteOrigin}"):`, error);
+            }
+            // decidePostEvent porte l'ordre non negociable (Origin toujours essaye en premier, meme en
+            // self-hosted) : voir sa docstring dans event-owner.ts, zone qui a deja produit deux
+            // regressions de suite avant d'etre extraite ici et testee isolement.
+            const decision = decidePostEvent(owner, !CLOUD_MODE, MCP_WORKSPACE_ID, parsed.project_id);
+            if (decision.kind === "quarantine") {
                 try {
-                    owner = await resolveEventOwner(headers, { byOrigin: resolveByUrl });
+                    await insertUnresolvedEvent(siteOrigin || null, parsed);
                 }
                 catch (error) {
-                    console.error(`[mark] resolution du proprietaire impossible (origin "${siteOrigin}"):`, error);
+                    console.error("[mark] mise en quarantaine impossible:", error);
                 }
-                if (!owner) {
-                    // Domaine absent, inconnu, ou sans project_id enregistre. On ne devine pas, mais on ne
-                    // perd rien : rejouable des que le domaine est enregistre via POST /register.
-                    try {
-                        await insertUnresolvedEvent(siteOrigin || null, parsed);
-                    }
-                    catch (error) {
-                        console.error("[mark] mise en quarantaine impossible:", error);
-                    }
-                    json(res, { ok: true, quarantined: true }, 202);
-                    return;
-                }
-                effectiveWorkspaceId = owner.workspace_id;
-                effectiveProjectId = owner.project_id;
-                if (workspace_id && workspace_id !== effectiveWorkspaceId) {
-                    console.warn(`[mark] workspace_id du corps ignore : annonce "${workspace_id}", ` +
-                        `proprietaire reel "${effectiveWorkspaceId}"`);
-                }
+                json(res, { ok: true, quarantined: true }, 202);
+                return;
+            }
+            const effectiveWorkspaceId = decision.workspace_id;
+            const effectiveProjectId = decision.project_id;
+            if (owner && workspace_id && workspace_id !== effectiveWorkspaceId) {
+                console.warn(`[mark] workspace_id du corps ignore : annonce "${workspace_id}", ` +
+                    `proprietaire reel "${effectiveWorkspaceId}"`);
             }
             // Fire billing callback if configured
             const eventDebitUrl = process.env.SILVERBACKBASE_EVENT_DEBIT_URL;

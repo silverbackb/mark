@@ -62,3 +62,36 @@ export async function resolveEventOwner(
 
   return null;
 }
+
+export type PostEventDecision =
+  | { kind: "insert"; workspace_id: string; project_id: string | null }
+  | { kind: "quarantine" };
+
+/**
+ * Decide quoi faire d'un evenement POST /e une fois le proprietaire (eventuellement) resolu par
+ * Origin. Extrait de handleRequestAsync et teste isolement : cette zone a deja produit deux
+ * regressions de suite (mode self-hosted detecte sur le mauvais signal, puis self-hosted qui
+ * shortcut la resolution par Origin et perdait le project_id de ses evenements navigateur).
+ *
+ * Ordre non negociable :
+ *   1. Un proprietaire resolu par Origin gagne TOUJOURS, cloud ou self-hosted : c'est la seule
+ *      source qui fonctionne pour un evenement emis par un vrai navigateur, quel que soit le mode.
+ *   2. Seulement si Origin echoue, le self-hosted (une instance, un operateur, pas de facturation
+ *      a proteger) peut faire confiance au project_id du corps — utile pour un appel manuel
+ *      (curl, script de test) qui n'a naturellement pas d'Origin.
+ *   3. Le cloud (multi-tenant, facture) n'a aucun repli quand Origin echoue : quarantaine.
+ */
+export function decidePostEvent(
+  owner: Owner | null,
+  isSelfHosted: boolean,
+  selfHostedWorkspaceId: string,
+  bodyProjectId: string | null | undefined
+): PostEventDecision {
+  if (owner) {
+    return { kind: "insert", workspace_id: owner.workspace_id, project_id: owner.project_id };
+  }
+  if (isSelfHosted) {
+    return { kind: "insert", workspace_id: selfHostedWorkspaceId, project_id: bodyProjectId ?? null };
+  }
+  return { kind: "quarantine" };
+}

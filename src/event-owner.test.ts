@@ -6,7 +6,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { resolveEventOwner, siteOriginFrom } from "./event-owner.js";
+import { resolveEventOwner, siteOriginFrom, decidePostEvent } from "./event-owner.js";
 
 const OWNER = { workspace_id: "ws-1", project_id: "proj-1" };
 
@@ -67,5 +67,40 @@ describe("resolveEventOwner", () => {
     const owner = await resolveEventOwner({}, spy);
     assert.equal(owner, null);
     assert.equal(called, false);
+  });
+});
+
+describe("decidePostEvent", () => {
+  // Regression exacte trouvee en production : le tracker n'embarque plus de project_id (phase
+  // precedente de la migration), donc un self-hosted qui shortcuterait la resolution par Origin
+  // perdrait le project_id de tous ses evenements navigateur.
+  test("un proprietaire resolu par Origin gagne, meme en self-hosted", () => {
+    const decision = decidePostEvent(OWNER, /* isSelfHosted */ true, "local", "corps-ignore");
+    assert.deepEqual(decision, { kind: "insert", workspace_id: OWNER.workspace_id, project_id: OWNER.project_id });
+  });
+
+  test("cloud sans proprietaire resolu : quarantaine, jamais de repli sur le corps", () => {
+    const decision = decidePostEvent(null, /* isSelfHosted */ false, "ws-cloud", "corps-jamais-cru");
+    assert.deepEqual(decision, { kind: "quarantine" });
+  });
+
+  test("self-hosted sans proprietaire resolu : repli sur le project_id du corps", () => {
+    // Cas d'usage reel : appel manuel (curl, script de test) sans navigateur, donc sans Origin.
+    const decision = decidePostEvent(null, /* isSelfHosted */ true, "local", "proj-manuel");
+    assert.deepEqual(decision, { kind: "insert", workspace_id: "local", project_id: "proj-manuel" });
+  });
+
+  test("self-hosted sans proprietaire ni project_id dans le corps : insert quand meme, project_id null", () => {
+    const decision = decidePostEvent(null, /* isSelfHosted */ true, "local", undefined);
+    assert.deepEqual(decision, { kind: "insert", workspace_id: "local", project_id: null });
+  });
+
+  test("un workspace_id annonce dans le corps n'influence jamais la decision cloud", () => {
+    // Regression exacte precedente : le mode self-hosted etait detecte via `workspace_id ===
+    // "local"` fourni par le corps. decidePostEvent ne prend meme plus ce paramètre : le corps ne
+    // peut donc plus influencer quoi que ce soit ici, seul l'appelant (isSelfHosted, calcule
+    // depuis la config serveur) le fait.
+    const decision = decidePostEvent(null, /* isSelfHosted */ false, "ws-cloud", undefined);
+    assert.deepEqual(decision, { kind: "quarantine" });
   });
 });

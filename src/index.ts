@@ -5,7 +5,7 @@ import { z } from "zod";
 import {
   migrate,
   insertEvent,
-  listSlugs,
+  listProjects,
   summary,
   funnel,
   compare,
@@ -18,6 +18,7 @@ import {
   resolveUrl,
   resolveByUrl,
   resolveBySlug,
+  resolveReadTarget,
   insertUnresolvedEvent,
   listSnippets,
   recentEvents,
@@ -30,6 +31,9 @@ const PORT = parseInt(process.env.PORT ?? process.env.MARK_PORT ?? "7331", 10);
 const PUBLIC_URL = (process.env.MARK_PUBLIC_URL ?? `http://localhost:${PORT}`).replace(/\/$/, "");
 // Workspace used by standalone stdio MCP (self-hosted). Cloud mode passes workspace_id per-request.
 const MCP_WORKSPACE_ID = process.env.MARK_WORKSPACE_ID ?? "local";
+// snippets.slug est encore NOT NULL le temps de la transition : les nouveaux enregistrements y
+// posent une valeur neutre, la colonne disparaitra avec le reste du slug.
+const DEFAULT_SLUG = "default";
 // Retention par defaut alignee sur Trail (voir code/trail/packages/server/src/index.ts).
 const RETENTION_DAYS = parseInt(process.env.MARK_RETENTION_DAYS ?? "365", 10);
 
@@ -91,13 +95,11 @@ function trackerScript(slug: string, wid: string, projectId: string | null): str
 })();`;
 }
 
-// wid n'est plus embarque dans le snippet : le workspace (et le project_id) sont resolus
-// server-side par domaine (Origin/Referer, voir GET /mark.js et resolveByUrl dans db.ts). slug
-// reste un parametre optionnel de groupement intra-projet ; omis quand il vaut le defaut
-// ("default"), pour que le tag <script> n'ait jamais besoin d'etre retouche par le client.
-function htmlSnippet(slug?: string): string {
-  const query = slug && slug !== "default" ? `?slug=${encodeURIComponent(slug)}` : "";
-  return `<script async src="${PUBLIC_URL}/mark.js${query}"></script>`;
+// Le tag ne transporte plus rien : workspace, client et site sont tous resolus server-side depuis
+// le domaine de la page (Origin/Referer, voir GET /mark.js et resolveByUrl dans db.ts). Il est
+// donc strictement identique pour tous les clients et n'a jamais a etre retouche.
+function htmlSnippet(): string {
+  return `<script async src="${PUBLIC_URL}/mark.js"></script>`;
 }
 
 // Derive device / os / browser from the request User-Agent. Server-side so it
@@ -124,20 +126,7 @@ function parseUA(ua: string): { device: string; os: string; browser: string } {
   return { device, os, browser };
 }
 
-// GTM-compatible snippet: a bare <script src> inside a Custom HTML tag does not
-// execute reliably. GTM runs inline JS reliably, so we inject the script via DOM.
-function gtmSnippet(slug?: string): string {
-  const query = slug && slug !== "default" ? `?slug=${encodeURIComponent(slug)}` : "";
-  const src = `${PUBLIC_URL}/mark.js${query}`;
-  return `<script>
-  (function(){
-    var s=document.createElement('script');
-    s.async=true;
-    s.src=${JSON.stringify(src)};
-    document.head.appendChild(s);
-  })();
-</script>`;
-}
+
 
 // --- HTTP server ---
 
@@ -494,28 +483,29 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
   }
 
   if (req.method === "GET" && url.pathname === "/q/list") {
-    json(res, await listSlugs(wid));
+    json(res, await listProjects(wid));
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/logs/recent") {
     const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 200);
-    json(res, await recentEvents(wid, limit));
+    // project_id optionnel : scope client, meme correctif que sur Trail.
+    json(res, await recentEvents(wid, limit, url.searchParams.get("project_id")));
     return;
   }
 
   const summaryMatch = url.pathname.match(/^\/q\/summary\/(.+)$/);
   if (req.method === "GET" && summaryMatch) {
-    const slug = decodeURIComponent(summaryMatch[1]);
+    const projectId = await resolveReadTarget(wid, decodeURIComponent(summaryMatch[1]));
     const days = parseInt(url.searchParams.get("days") ?? "7", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
-    json(res, await summary(wid, slug, isNaN(days) ? 7 : days, tag));
+    json(res, await summary(wid, projectId, isNaN(days) ? 7 : days, tag));
     return;
   }
 
   const funnelMatch = url.pathname.match(/^\/q\/funnel\/(.+)$/);
   if (req.method === "GET" && funnelMatch) {
-    const slug = decodeURIComponent(funnelMatch[1]);
+    const projectId = await resolveReadTarget(wid, decodeURIComponent(funnelMatch[1]));
     const stepsParam = url.searchParams.get("steps") ?? "";
     const steps = stepsParam.split(",").map((s) => s.trim()).filter(Boolean);
     const days = parseInt(url.searchParams.get("days") ?? "30", 10);
@@ -524,13 +514,13 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       json(res, { error: "steps param requires at least 2 comma-separated event names" }, 400);
       return;
     }
-    json(res, await funnel(wid, slug, steps, isNaN(days) ? 30 : days, tag));
+    json(res, await funnel(wid, projectId, steps, isNaN(days) ? 30 : days, tag));
     return;
   }
 
   const compareMatch = url.pathname.match(/^\/q\/compare\/(.+)$/);
   if (req.method === "GET" && compareMatch) {
-    const slug = decodeURIComponent(compareMatch[1]);
+    const projectId = await resolveReadTarget(wid, decodeURIComponent(compareMatch[1]));
     const pivot = url.searchParams.get("pivot") ?? "";
     if (!pivot || isNaN(new Date(pivot).getTime())) {
       json(res, { error: "pivot param required — ISO date e.g. 2026-06-01" }, 400);
@@ -540,35 +530,35 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     const daysBefore = parseInt(url.searchParams.get("days_before") ?? "14", 10);
     const daysAfter = parseInt(url.searchParams.get("days_after") ?? "14", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
-    json(res, await compare(wid, slug, pivot, event, isNaN(daysBefore) ? 14 : daysBefore, isNaN(daysAfter) ? 14 : daysAfter, tag));
+    json(res, await compare(wid, projectId, pivot, event, isNaN(daysBefore) ? 14 : daysBefore, isNaN(daysAfter) ? 14 : daysAfter, tag));
     return;
   }
 
   const frictionMatch = url.pathname.match(/^\/q\/friction\/(.+)$/);
   if (req.method === "GET" && frictionMatch) {
-    const slug = decodeURIComponent(frictionMatch[1]);
+    const projectId = await resolveReadTarget(wid, decodeURIComponent(frictionMatch[1]));
     const days = parseInt(url.searchParams.get("days") ?? "30", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
-    json(res, await friction(wid, slug, isNaN(days) ? 30 : days, tag));
+    json(res, await friction(wid, projectId, isNaN(days) ? 30 : days, tag));
     return;
   }
 
   const journeyMatch = url.pathname.match(/^\/q\/journey\/(.+)$/);
   if (req.method === "GET" && journeyMatch) {
-    const slug = decodeURIComponent(journeyMatch[1]);
+    const projectId = await resolveReadTarget(wid, decodeURIComponent(journeyMatch[1]));
     const entity_id = url.searchParams.get("entity_id") ?? "";
     if (!entity_id) {
       json(res, { error: "entity_id param required" }, 400);
       return;
     }
     const days = parseInt(url.searchParams.get("days") ?? "30", 10);
-    json(res, await journey(wid, slug, entity_id, isNaN(days) ? 30 : days));
+    json(res, await journey(wid, projectId, entity_id, isNaN(days) ? 30 : days));
     return;
   }
 
   const breakdownMatch = url.pathname.match(/^\/q\/breakdown\/(.+)$/);
   if (req.method === "GET" && breakdownMatch) {
-    const slug = decodeURIComponent(breakdownMatch[1]);
+    const projectId = await resolveReadTarget(wid, decodeURIComponent(breakdownMatch[1]));
     const event_name = url.searchParams.get("event") ?? "";
     const property = url.searchParams.get("property") ?? "";
     if (!event_name || !property) {
@@ -578,7 +568,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
     const days = parseInt(url.searchParams.get("days") ?? "30", 10);
     const tag = url.searchParams.get("tag") ?? undefined;
     const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "30", 10) || 30, 100);
-    json(res, await breakdown(wid, slug, event_name, property, isNaN(days) ? 30 : days, tag, limit));
+    json(res, await breakdown(wid, projectId, event_name, property, isNaN(days) ? 30 : days, tag, limit));
     return;
   }
 
@@ -698,15 +688,14 @@ Returns: { snippet, snippet_gtm, ingestion_url, usage, registered? }
   - snippet: standard <script> for direct insertion before </body>
   - snippet_gtm: GTM-compatible version (dynamic injection) for a Custom HTML tag`,
       inputSchema: z.object({
-        slug: z.string().min(1).max(100).describe("Unique identifier for the app or page to track"),
-        url: z.string().url().optional().describe("URL of the site being instrumented — registers the URL→slug mapping"),
+        project_id: z.string().min(1).max(200).describe("Client identifier this site belongs to"),
+        url: z.string().url().optional().describe("URL of the site being instrumented — registers the domain → project_id mapping, condition for ingestion to attribute events"),
       }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, url }) => {
+    async ({ project_id, url }) => {
       const result: Record<string, unknown> = {
-        snippet: htmlSnippet(slug),
-        snippet_gtm: gtmSnippet(slug),
+        snippet: htmlSnippet(),
         ingestion_url: `${PUBLIC_URL}/e`,
         usage: {
           track: `markjs.track('event_name', { optional: 'props' })`,
@@ -715,7 +704,7 @@ Returns: { snippet, snippet_gtm, ingestion_url, usage, registered? }
         },
       };
       if (url) {
-        const reg = await registerSnippet(MCP_WORKSPACE_ID, url, slug);
+        const reg = await registerSnippet(MCP_WORKSPACE_ID, url, DEFAULT_SLUG, project_id);
         result.registered = reg;
       }
       return ok(result);
@@ -779,7 +768,7 @@ Args:
 
 Returns: { ok: true, slug, event_name }`,
       inputSchema: z.object({
-        slug: z.string().min(1).max(100).describe("App or page identifier"),
+        project_id: z.string().min(1).max(200).describe("App or page identifier"),
         session_id: z.string().min(1).describe("Unique session identifier"),
         event_name: z.string().min(1).max(100).describe("Event name"),
         properties: z.record(z.unknown()).optional().describe("Optional key-value metadata"),
@@ -789,10 +778,13 @@ Returns: { ok: true, slug, event_name }`,
       }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
-    async ({ slug, session_id, event_name, properties, tag, entity_id, ts }) => {
+    async ({ project_id, session_id, event_name, properties, tag, entity_id, ts }) => {
       try {
-        await insertEvent(MCP_WORKSPACE_ID, slug, session_id, event_name, (properties ?? {}) as Record<string, unknown>, tag, entity_id, ts);
-        return ok({ ok: true, slug, event_name });
+        // project_id en dernier argument : la 2e position est la colonne slug, en voie de
+        // suppression. L'y passer ecrirait l'identifiant client dans la mauvaise colonne, sans que
+        // le typage ne s'en apercoive (les deux sont des string).
+        await insertEvent(MCP_WORKSPACE_ID, null, session_id, event_name, (properties ?? {}) as Record<string, unknown>, tag, entity_id, ts, project_id);
+        return ok({ ok: true, project_id, event_name });
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
       }
@@ -802,26 +794,26 @@ Returns: { ok: true, slug, event_name }`,
   server.registerTool(
     "mark_list",
     {
-      title: "List Active Slugs",
-      description: `List all slugs that have recorded events, with session and event counts.
+      title: "List Active Clients",
+      description: `List all clients (project_id) that have recorded events, with session and event counts.
 
-Returns: Array of { slug, sessions, events, last_event_ts }
+Returns: Array of { project_id, sessions, events, last_event_ts }
 
 Use when: you want to see what apps are currently being tracked before deeper analysis.`,
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async () => ok(await listSlugs(MCP_WORKSPACE_ID))
+    async () => ok(await listProjects(MCP_WORKSPACE_ID))
   );
 
   server.registerTool(
     "mark_summary",
     {
       title: "Get App Summary",
-      description: `High-level overview of a slug: total sessions, event count, and top events by frequency.
+      description: `High-level overview of a client: total sessions, event count, and top events by frequency.
 
 Args:
-  - slug (string): App or page identifier
+  - project_id (string): Client identifier (see project_list)
   - days (number, optional): Lookback window in days (default 7, max 365)
   - tag (string, optional): Filter to events with this tag only — useful for comparing segments
 
@@ -829,13 +821,13 @@ Returns: { slug, period, sessions, events, top_events[], tag? }
 
 Use when: you want a quick health check. Call mark_friction or mark_funnel for deeper analysis.`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("App or page identifier"),
+        project_id: z.string().min(1).describe("Client identifier (project_id, see project_list)"),
         days: z.number().int().min(1).max(365).optional().default(7).describe("Lookback window in days (default 7)"),
         tag: z.string().max(100).optional().describe("Filter to events with this tag only"),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, days, tag }) => ok(await summary(MCP_WORKSPACE_ID, slug, days ?? 7, tag))
+    async ({ project_id, days, tag }) => ok(await summary(MCP_WORKSPACE_ID, project_id, days ?? 7, tag))
   );
 
   server.registerTool(
@@ -845,7 +837,7 @@ Use when: you want a quick health check. Call mark_friction or mark_funnel for d
       description: `Measure conversion through an ordered list of events. The agent defines the funnel steps.
 
 Args:
-  - slug (string): App or page identifier
+  - project_id (string): Client identifier (see project_list)
   - steps (string[]): Ordered event names forming the funnel (min 2 steps)
   - days (number, optional): Lookback window in days (default 30)
   - tag (string, optional): Filter to a specific segment — e.g. compare "variant-a" vs "variant-b" by calling twice
@@ -858,14 +850,14 @@ Examples:
   - mark_funnel("onboarding", ["page_view", "signup_start", "signup_complete"])
   - mark_funnel("checkout", ["add_to_cart", "checkout_start", "purchase"], 30, "variant-a")`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("App or page identifier"),
+        project_id: z.string().min(1).describe("Client identifier (project_id, see project_list)"),
         steps: z.array(z.string().min(1)).min(2).describe("Ordered list of event names"),
         days: z.number().int().min(1).max(365).optional().default(30).describe("Lookback window in days (default 30)"),
         tag: z.string().max(100).optional().describe("Filter to a specific segment (e.g. 'variant-a')"),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, steps, days, tag }) => ok(await funnel(MCP_WORKSPACE_ID, slug, steps, days ?? 30, tag))
+    async ({ project_id, steps, days, tag }) => ok(await funnel(MCP_WORKSPACE_ID, project_id, steps, days ?? 30, tag))
   );
 
   server.registerTool(
@@ -875,7 +867,7 @@ Examples:
       description: `Compare behavior before and after a date pivot. Measures impact of a change.
 
 Args:
-  - slug (string): App or page identifier
+  - project_id (string): Client identifier (see project_list)
   - pivot (string): ISO date string as boundary (e.g. "2026-06-01")
   - event (string, optional): If provided, compares completion rate for this event; otherwise compares session counts
   - days_before (number, optional): Days to include before the pivot (default 14)
@@ -887,7 +879,7 @@ Returns: { before, after, delta, metric, tag? }
 
 Use when: you shipped a redesign, copy change, or fix and want to measure the behavioral impact.`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("App or page identifier"),
+        project_id: z.string().min(1).describe("Client identifier (project_id, see project_list)"),
         pivot: z.string().describe("ISO date string as comparison boundary (e.g. \"2026-06-01\")"),
         event: z.string().optional().describe("Compare completion rate for this event; otherwise compares session counts"),
         days_before: z.number().int().min(1).max(180).optional().default(14).describe("Days before the pivot (default 14)"),
@@ -896,11 +888,11 @@ Use when: you shipped a redesign, copy change, or fix and want to measure the be
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, pivot, event, days_before, days_after, tag }) => {
+    async ({ project_id, pivot, event, days_before, days_after, tag }) => {
       if (isNaN(new Date(pivot).getTime())) {
         return err(`Invalid pivot date "${pivot}". Use ISO format e.g. "2026-06-01".`);
       }
-      return ok(await compare(MCP_WORKSPACE_ID, slug, pivot, event ?? null, days_before ?? 14, days_after ?? 14, tag));
+      return ok(await compare(MCP_WORKSPACE_ID, project_id, pivot, event ?? null, days_before ?? 14, days_after ?? 14, tag));
     }
   );
 
@@ -911,7 +903,7 @@ Use when: you shipped a redesign, copy change, or fix and want to measure the be
       description: `Identify where users stop progressing. Events ordered by average occurrence time, each step shows sessions that stopped there.
 
 Args:
-  - slug (string): App or page identifier
+  - project_id (string): Client identifier (see project_list)
   - days (number, optional): Lookback window in days (default 30)
   - tag (string, optional): Filter to a specific segment
 
@@ -921,13 +913,13 @@ Returns: { slug, total_sessions, drop_events[], tag? }
 Use when: you don't know which step is the problem — let Mark surface the friction point.
 Then use mark_funnel to zoom in on the suspect step.`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("App or page identifier"),
+        project_id: z.string().min(1).describe("Client identifier (project_id, see project_list)"),
         days: z.number().int().min(1).max(365).optional().default(30).describe("Lookback window in days (default 30)"),
         tag: z.string().max(100).optional().describe("Filter to a specific segment"),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, days, tag }) => ok(await friction(MCP_WORKSPACE_ID, slug, days ?? 30, tag))
+    async ({ project_id, days, tag }) => ok(await friction(MCP_WORKSPACE_ID, project_id, days ?? 30, tag))
   );
 
   server.registerTool(
@@ -938,7 +930,7 @@ Then use mark_funnel to zoom in on the suspect step.`,
 Ordered by timestamp — shows the complete behavioral sequence of that entity.
 
 Args:
-  - slug (string): App or page identifier
+  - project_id (string): Client identifier (see project_list)
   - entity_id (string): The entity ID passed via markjs.identify() or mark_ingest(entity_id)
   - days (number, optional): Lookback window in days (default 30)
 
@@ -952,13 +944,13 @@ Returns:
 
 Use when: you want to replay or debug a specific user's path. Complement with mark_funnel for aggregate view.`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("App or page identifier"),
+        project_id: z.string().min(1).describe("Client identifier (project_id, see project_list)"),
         entity_id: z.string().min(1).max(200).describe("Entity ID to retrieve events for"),
         days: z.number().int().min(1).max(365).optional().default(30).describe("Lookback window in days (default 30)"),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, entity_id, days }) => ok(await journey(MCP_WORKSPACE_ID, slug, entity_id, days ?? 30))
+    async ({ project_id, entity_id, days }) => ok(await journey(MCP_WORKSPACE_ID, project_id, entity_id, days ?? 30))
   );
 
   server.registerTool(
@@ -977,7 +969,7 @@ Works for any event/property combination:
   - mark_breakdown("at2o", "scroll_depth", "percent") → scroll depth distribution
 
 Args:
-  - slug (string): App or page identifier
+  - project_id (string): Client identifier (see project_list)
   - event_name (string): Event to group (e.g. "page_view", "click")
   - property (string): Property key to group by (e.g. "url", "label", "percent")
   - days (number, optional): Lookback window in days (default 30)
@@ -998,7 +990,7 @@ Returns:
 Use when: you see a high event count in mark_summary and need to understand the distribution.
 Complement with mark_funnel to measure conversion from a specific page.`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("App or page identifier"),
+        project_id: z.string().min(1).describe("Client identifier (project_id, see project_list)"),
         event_name: z.string().min(1).max(100).describe("Event name to group (e.g. \"page_view\", \"click\")"),
         property: z.string().min(1).max(100).describe("Property key to group by (e.g. \"url\", \"label\", \"percent\")"),
         days: z.number().int().min(1).max(365).optional().default(30).describe("Lookback window in days (default 30)"),
@@ -1007,8 +999,8 @@ Complement with mark_funnel to measure conversion from a specific page.`,
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug, event_name, property, days, tag, limit }) =>
-      ok(await breakdown(MCP_WORKSPACE_ID, slug, event_name, property, days ?? 30, tag, limit ?? 30))
+    async ({ project_id, event_name, property, days, tag, limit }) =>
+      ok(await breakdown(MCP_WORKSPACE_ID, project_id, event_name, property, days ?? 30, tag, limit ?? 30))
   );
 
   server.registerTool(
@@ -1024,13 +1016,13 @@ Returns: { deleted: number }
 
 WARNING: Always confirm with the user before calling this. Data cannot be recovered.`,
       inputSchema: z.object({
-        slug: z.string().min(1).describe("Identifier to purge — all events deleted"),
+        project_id: z.string().min(1).describe("Client identifier whose events are all deleted"),
       }).strict(),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug }) => {
+    async ({ project_id }) => {
       try {
-        return ok(await purge(MCP_WORKSPACE_ID, slug));
+        return ok(await purge(MCP_WORKSPACE_ID, project_id));
       } catch (e) {
         return err(e instanceof Error ? e.message : String(e));
       }

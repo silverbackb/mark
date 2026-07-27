@@ -11,14 +11,14 @@ export { sql };
 // --- Types ---
 
 export interface EventRow {
-  slug: string;
+  project_id: string;
   sessions: number;
   events: number;
   last_event_ts: number;
 }
 
 export interface SummaryResult {
-  slug: string;
+  project_id: string;
   period: string;
   sessions: number;
   events: number;
@@ -27,7 +27,7 @@ export interface SummaryResult {
 }
 
 export interface FunnelResult {
-  slug: string;
+  project_id: string;
   steps: string[];
   counts: number[];
   rates: number[];
@@ -51,7 +51,7 @@ export interface FrictionItem {
 }
 
 export interface FrictionResult {
-  slug: string;
+  project_id: string;
   total_sessions: number;
   drop_events: FrictionItem[];
   tag?: string;
@@ -74,7 +74,7 @@ export interface JourneyEvent {
 }
 
 export interface JourneyResult {
-  slug: string;
+  project_id: string;
   entity_id: string;
   total_events: number;
   events: JourneyEvent[];
@@ -84,7 +84,7 @@ export interface RecentEvent {
   ts: number;
   event_name: string;
   session_id: string;
-  slug: string;
+  project_id: string;
   tag: string | null;
 }
 
@@ -95,7 +95,7 @@ export interface BreakdownItem {
 }
 
 export interface BreakdownResult {
-  slug: string;
+  project_id: string;
   event_name: string;
   property: string;
   period: string;
@@ -268,9 +268,9 @@ export async function insertUnresolvedEvent(origin: string | null, payload: unkn
   `;
 }
 
-export async function purge(workspaceId: string, slug: string): Promise<{ deleted: number }> {
+export async function purge(workspaceId: string, projectId: string): Promise<{ deleted: number }> {
   const result = await sql`
-    WITH deleted AS (DELETE FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} RETURNING 1)
+    WITH deleted AS (DELETE FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} RETURNING 1)
     SELECT COUNT(*) AS n FROM deleted
   `;
   return { deleted: Number((result[0] as { n: string }).n) };
@@ -310,39 +310,68 @@ export async function purgeOldEvents(retentionDays: number): Promise<{ removed: 
 // QUERIES
 // =============================================================================
 
-export async function listSlugs(workspaceId: string): Promise<EventRow[]> {
+export async function listProjects(workspaceId: string): Promise<EventRow[]> {
   const rows = await sql`
-    SELECT slug,
+    SELECT project_id,
            COUNT(DISTINCT session_id) AS sessions,
            COUNT(*) AS events,
            MAX(ts) AS last_event_ts
     FROM events
-    WHERE workspace_id = ${workspaceId}
-    GROUP BY slug
+    WHERE workspace_id = ${workspaceId} AND project_id IS NOT NULL
+    GROUP BY project_id
     ORDER BY last_event_ts DESC
   `;
   return rows.map(r => ({
-    slug: r.slug as string,
+    project_id: r.project_id as string,
     sessions: Number(r.sessions),
     events: Number(r.events),
     last_event_ts: Number(r.last_event_ts),
   }));
 }
 
-export async function summary(workspaceId: string, slug: string, days: number, tag?: string): Promise<SummaryResult> {
+/**
+ * Pont de lecture, TEMPORAIRE (retire en meme temps que la colonne slug).
+ *
+ * Les routes /q/* prennent desormais un project_id. Pendant la fenetre ou la passerelle et le
+ * dashboard envoient encore un slug, un identifiant non reconnu ne produirait pas une erreur mais
+ * un resultat a zero : un dashboard qui affiche "aucune donnee" alors que le client en a est pire
+ * qu'une panne visible, c'est l'echec vers le faux que le projet interdit.
+ *
+ * Traduit donc un slug en project_id quand c'est sans ambiguite, et rend l'entree inchangee
+ * sinon. Ne devine jamais : plusieurs project_id pour un meme slug rend l'entree telle quelle.
+ */
+export async function resolveReadTarget(workspaceId: string, param: string): Promise<string> {
+  const [asProject] = await sql`
+    SELECT 1 FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${param} LIMIT 1
+  `;
+  if (asProject) return param;
+
+  const rows = await sql`
+    SELECT DISTINCT project_id FROM events
+    WHERE workspace_id = ${workspaceId} AND slug = ${param} AND project_id IS NOT NULL
+  `;
+  if (rows.length === 1) {
+    const translated = (rows[0] as { project_id: string }).project_id;
+    console.warn(`[mark] lecture par slug "${param}" traduite en project_id "${translated}" (pont temporaire)`);
+    return translated;
+  }
+  return param;
+}
+
+export async function summary(workspaceId: string, projectId: string, days: number, tag?: string): Promise<SummaryResult> {
   const since = Date.now() - days * 86_400_000;
   const t = tag ?? null;
   const [agg] = await sql`
     SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS events
-    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
   `;
   const top = await sql`
     SELECT event_name AS event, COUNT(*) AS count
-    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
     GROUP BY event_name ORDER BY count DESC LIMIT 10
   `;
   return {
-    slug,
+    project_id: projectId,
     period: `${days}d`,
     sessions: Number((agg as { sessions: string }).sessions ?? 0),
     events: Number((agg as { events: string }).events ?? 0),
@@ -351,7 +380,7 @@ export async function summary(workspaceId: string, slug: string, days: number, t
   };
 }
 
-export async function funnel(workspaceId: string, slug: string, steps: string[], days: number, tag?: string): Promise<FunnelResult> {
+export async function funnel(workspaceId: string, projectId: string, steps: string[], days: number, tag?: string): Promise<FunnelResult> {
   const since = Date.now() - days * 86_400_000;
   const t = tag ?? null;
   const counts: number[] = [];
@@ -361,14 +390,14 @@ export async function funnel(workspaceId: string, slug: string, steps: string[],
     if (sub.length === 1) {
       const [row] = await sql`
         SELECT COUNT(DISTINCT session_id) AS n FROM events
-        WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${sub[0]} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+        WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND event_name = ${sub[0]} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
       `;
       counts.push(Number((row as { n: string }).n ?? 0));
     } else {
       const [row] = await sql`
         SELECT COUNT(*) AS n FROM (
           SELECT session_id FROM events
-          WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ANY(${sub}) AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+          WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND event_name = ANY(${sub}) AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
           GROUP BY session_id HAVING COUNT(DISTINCT event_name) = ${sub.length}
         ) sub
       `;
@@ -384,12 +413,12 @@ export async function funnel(workspaceId: string, slug: string, steps: string[],
     const drop = (counts[i - 1] ?? 0) - (counts[i] ?? 0);
     if (drop > maxDrop) { maxDrop = drop; drop_at = steps[i] ?? null; }
   }
-  return { slug, steps, counts, rates, drop_at, ...(tag ? { tag } : {}) };
+  return { project_id: projectId, steps, counts, rates, drop_at, ...(tag ? { tag } : {}) };
 }
 
 export async function compare(
   workspaceId: string,
-  slug: string, pivot: string, event: string | null,
+  projectId: string, pivot: string, event: string | null,
   daysBefore: number, daysAfter: number, tag?: string
 ): Promise<CompareResult> {
   const pivotTs = new Date(pivot).getTime();
@@ -398,14 +427,14 @@ export async function compare(
   const getStats = async (from: number, to: number) => {
     const [base] = await sql`
       SELECT COUNT(DISTINCT session_id) AS sessions, COUNT(*) AS events
-      FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
+      FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
     `;
     const sessions = Number((base as { sessions: string }).sessions ?? 0);
     const events = Number((base as { events: string }).events ?? 0);
     if (event) {
       const [comp] = await sql`
         SELECT COUNT(DISTINCT session_id) AS completions
-        FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${event} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
+        FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND event_name = ${event} AND ts >= ${from} AND ts < ${to} AND (${t}::text IS NULL OR tag = ${t})
       `;
       return { sessions, events, completions: Number((comp as { completions: string }).completions ?? 0) };
     }
@@ -427,17 +456,17 @@ export async function compare(
   };
 }
 
-export async function friction(workspaceId: string, slug: string, days: number, tag?: string): Promise<FrictionResult> {
+export async function friction(workspaceId: string, projectId: string, days: number, tag?: string): Promise<FrictionResult> {
   const since = Date.now() - days * 86_400_000;
   const t = tag ?? null;
   const [totalRow] = await sql`
     SELECT COUNT(DISTINCT session_id) AS n FROM events
-    WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
   `;
   const total = Number((totalRow as { n: string }).n ?? 0);
   const ordered = await sql`
     SELECT event_name, COUNT(DISTINCT session_id) AS reached, AVG(ts) AS avg_ts
-    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
+    FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
     GROUP BY event_name ORDER BY avg_ts ASC
   `;
   const drops: FrictionItem[] = ordered.map((e, i) => {
@@ -451,14 +480,14 @@ export async function friction(workspaceId: string, slug: string, days: number, 
       drop_rate: reached > 0 ? `${((stopped / reached) * 100).toFixed(1)}%` : "0%",
     };
   });
-  return { slug, total_sessions: total, drop_events: drops, ...(tag ? { tag } : {}) };
+  return { project_id: projectId, total_sessions: total, drop_events: drops, ...(tag ? { tag } : {}) };
 }
 
-export async function journey(workspaceId: string, slug: string, entity_id: string, days: number): Promise<JourneyResult> {
+export async function journey(workspaceId: string, projectId: string, entity_id: string, days: number): Promise<JourneyResult> {
   const since = Date.now() - days * 86_400_000;
   const rows = await sql`
     SELECT ts, event_name, session_id, properties, tag
-    FROM events WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND entity_id = ${entity_id} AND ts >= ${since}
+    FROM events WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND entity_id = ${entity_id} AND ts >= ${since}
     ORDER BY ts ASC
   `;
   const events: JourneyEvent[] = rows.map(r => ({
@@ -468,7 +497,7 @@ export async function journey(workspaceId: string, slug: string, entity_id: stri
     properties: (r.properties ?? {}) as Record<string, unknown>,
     tag: (r.tag ?? null) as string | null,
   }));
-  return { slug, entity_id, total_events: events.length, events };
+  return { project_id: projectId, entity_id, total_events: events.length, events };
 }
 
 // =============================================================================
@@ -575,7 +604,7 @@ export async function listSnippets(workspaceId: string): Promise<SnippetRow[]> {
 
 export async function breakdown(
   workspaceId: string,
-  slug: string,
+  projectId: string,
   event_name: string,
   property: string,
   days: number,
@@ -587,7 +616,7 @@ export async function breakdown(
   const [totalRow] = await sql`
     SELECT COUNT(DISTINCT session_id) AS n
     FROM events
-    WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${event_name}
+    WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND event_name = ${event_name}
       AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
   `;
   const rows = await sql`
@@ -595,14 +624,14 @@ export async function breakdown(
            COUNT(DISTINCT session_id) AS sessions,
            COUNT(*) AS events
     FROM events
-    WHERE workspace_id = ${workspaceId} AND slug = ${slug} AND event_name = ${event_name}
+    WHERE workspace_id = ${workspaceId} AND project_id = ${projectId} AND event_name = ${event_name}
       AND ts >= ${since} AND (${t}::text IS NULL OR tag = ${t})
     GROUP BY value
     ORDER BY sessions DESC
     LIMIT ${limit}
   `;
   return {
-    slug,
+    project_id: projectId,
     event_name,
     property,
     period: `${days}d`,
@@ -616,17 +645,21 @@ export async function breakdown(
   };
 }
 
-export async function recentEvents(workspaceId: string, limit = 50): Promise<RecentEvent[]> {
+// projectId optionnel : sans lui, la fenetre des N derniers evenements est monopolisee par le
+// client le plus actif du workspace et un client calme parait sans donnees. Meme correctif que
+// sur Trail (GET /logs/recent, commit cf1a064).
+export async function recentEvents(workspaceId: string, limit = 50, projectId?: string | null): Promise<RecentEvent[]> {
+  const scope = projectId ? sql`AND project_id = ${projectId}` : sql``;
   const rows = await sql`
-    SELECT ts, event_name, session_id, slug, tag
-    FROM events WHERE workspace_id = ${workspaceId}
+    SELECT ts, event_name, session_id, project_id, tag
+    FROM events WHERE workspace_id = ${workspaceId} ${scope}
     ORDER BY ts DESC LIMIT ${limit}
   `;
   return rows.map(r => ({
     ts: Number(r.ts),
     event_name: r.event_name as string,
     session_id: r.session_id as string,
-    slug: r.slug as string,
+    project_id: (r.project_id ?? "") as string,
     tag: (r.tag ?? null) as string | null,
   }));
 }

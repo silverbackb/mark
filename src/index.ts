@@ -39,15 +39,19 @@ const RETENTION_DAYS = parseInt(process.env.MARK_RETENTION_DAYS ?? "365", 10);
 
 // --- HTTP tracker script ---
 
-function trackerScript(slug: string, wid: string, projectId: string | null): string {
-  const projectIdLiteral = projectId ? `'${projectId}'` : "null";
+// Le payload ne transporte plus aucun identifiant de compte : POST /e resout desormais le
+// workspace et le client depuis l'Origin de la requete (voir event-owner.ts), exactement comme
+// GET /mark.js resout deja ce meme tracker. Les embarquer ici serait redondant (le serveur les
+// ignore) et c'etait justement le trou de securite ferme par le correctif C1 : un identifiant lu
+// en clair dans le payload d'une page publique n'est jamais une preuve.
+function trackerScript(): string {
   return `(function(){
   var k='_mark_sid';
   var sid=sessionStorage.getItem(k)||(Math.random().toString(36).slice(2)+Date.now().toString(36));
   sessionStorage.setItem(k,sid);
   var _eid=null,_tag=null;
   function send(evt,props){
-    var payload={workspace_id:'${wid}',slug:'${slug}',project_id:${projectIdLiteral},session_id:sid,event_name:evt,properties:props||{}};
+    var payload={session_id:sid,event_name:evt,properties:props||{}};
     if(_eid) payload.entity_id=_eid;
     if(_tag) payload.tag=_tag;
     fetch('${PUBLIC_URL}/e',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
@@ -231,10 +235,6 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
   }
 
   if (req.method === "GET" && url.pathname === "/mark.js") {
-    // Slug explicite dans l'URL uniquement quand l'installateur en veut un precis (plusieurs apps
-    // suivies separement sur un meme domaine). Le tag canonique n'en porte pas : il est alors
-    // resolu par domaine plus bas, comme le workspace et le project_id.
-    const requestedSlug = url.searchParams.get("slug");
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
 
@@ -263,6 +263,10 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       return;
     }
 
+    // Seul ce controle de presence dans la table snippets justifie encore resolveByUrl ici : le
+    // payload emis par le tracker ne porte plus rien a resoudre (voir trackerScript). Un domaine
+    // absent recoit un script inoffensif plutot que des evenements qui partiraient en quarantaine
+    // sans que personne ne le sache.
     let resolved: { workspace_id: string; project_id: string | null; slug: string | null } | null = null;
     try {
       resolved = await resolveByUrl(siteOrigin);
@@ -278,14 +282,8 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       return;
     }
 
-    // Priorite : slug explicite de l'URL, puis slug enregistre pour ce domaine, puis "default".
-    // Sans le deuxieme etage, le tag canonique (sans query string) faisait tomber TOUS les clients
-    // d'un workspace sous le meme slug "default", alors que le dashboard et les outils mark_*
-    // segmentent par slug : les donnees de deux clients s'y confondaient.
-    const slug = requestedSlug ?? resolved.slug ?? "default";
-
     res.writeHead(200);
-    res.end(trackerScript(slug, resolved.workspace_id, resolved.project_id));
+    res.end(trackerScript());
     return;
   }
 

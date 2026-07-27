@@ -16,14 +16,31 @@ export const LIMITS = {
 // mais l'Origin/Referer reel envoye par un navigateur l'a systematiquement pour les clients reels
 // verifies en prod. Sans ce retrait sur le hostname, resolveByUrl ne matchait jamais : la
 // resolution par domaine echouait en silence pour tous les clients.
-function normalizeUrl(url) {
+// Bug reel trouve en production le 2026-07-27 : canonicalDomain (registre Root) est toujours
+// stocke SANS protocole ("debarras-easy.fr"), alors qu'un en-tete Origin de navigateur en a
+// TOUJOURS un ("https://debarras-easy.fr"). `new URL("debarras-easy.fr")` echoue (pas de
+// protocole), et l'ancien fallback retournait la chaine brute telle quelle : l'entree stockee
+// ("debarras-easy.fr") ne matchait alors plus jamais un Origin normalise ("https://debarras-easy.fr"),
+// et l'ingestion du client partait en quarantaine indefiniment malgre un enregistrement reussi.
+// Les 3 clients historiques fonctionnaient uniquement parce qu'ils avaient ete enregistres avant
+// ce chemin de code (avec le protocole deja present) ; tout NOUVEAU client enregistre via
+// mark_snippet en aurait ete affecte.
+export function normalizeUrl(url) {
+    const trimmed = url.trim();
     try {
-        const u = new URL(url.trim());
+        const u = new URL(trimmed);
         const hostname = u.hostname.replace(/^www\./, "");
         return `${u.protocol}//${hostname}${u.port ? `:${u.port}` : ""}${u.pathname.replace(/\/$/, "")}`;
     }
     catch {
-        return url.trim().replace(/\/$/, "");
+        // Pas de protocole analysable : on en suppose un plutot que de stocker une forme qu'aucun
+        // Origin reel ne pourra jamais produire. https par defaut, coherent avec tous les sites reels.
+        try {
+            return normalizeUrl(`https://${trimmed}`);
+        }
+        catch {
+            return trimmed.replace(/\/$/, "");
+        }
     }
 }
 // =============================================================================

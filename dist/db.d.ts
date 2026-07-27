@@ -102,6 +102,7 @@ export declare const LIMITS: {
     properties_max_keys: number;
     property_string_max: number;
 };
+export declare function normalizeUrl(url: string): string;
 export declare function migrate(): Promise<void>;
 export declare function insertEvent(workspaceId: string, session_id: string, event_name: string, properties?: Record<string, unknown>, tag?: string | null, entity_id?: string | null, ts?: number, projectId?: string | null): Promise<void>;
 /**

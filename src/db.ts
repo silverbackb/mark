@@ -474,15 +474,21 @@ export async function resolveUrl(workspaceId: string, url: string): Promise<Snip
  * est reelle et la fonction echoue vers le vide (null) plutot que de deviner un proprietaire —
  * meme principe que workspacesForSlug.
  */
-export async function resolveByUrl(url: string): Promise<{ workspace_id: string; project_id: string | null } | null> {
+export async function resolveByUrl(url: string): Promise<{ workspace_id: string; project_id: string | null; slug: string | null } | null> {
   const normalized = normalizeUrl(url);
-  const rows = await sql`SELECT workspace_id, project_id FROM snippets WHERE url = ${normalized}`;
+  const rows = await sql`SELECT workspace_id, project_id, slug FROM snippets WHERE url = ${normalized}`;
   if (rows.length === 0) return null;
   const workspaces = new Set(rows.map(r => r.workspace_id as string));
   if (workspaces.size !== 1) return null;
   const withProjectId = rows.find(r => r.project_id != null);
   const projectId = withProjectId ? (withProjectId.project_id as string) : null;
-  return { workspace_id: [...workspaces][0] as string, project_id: projectId };
+  // Le slug enregistre pour ce domaine, pour que le tag <script> nu (sans query string) n'envoie
+  // pas tous les clients sous "default". On ne devine rien : plusieurs slugs enregistres sur le
+  // meme domaine est un cas legitime (plusieurs apps suivies separement) mais ambigu ici, donc on
+  // ne resout que s'il n'y en a qu'un seul. Sinon null, et l'appelant retombe sur "default".
+  const slugs = new Set(rows.map(r => r.slug as string).filter(Boolean));
+  const slug = slugs.size === 1 ? ([...slugs][0] as string) : null;
+  return { workspace_id: [...workspaces][0] as string, project_id: projectId, slug };
 }
 
 /**

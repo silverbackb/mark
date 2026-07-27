@@ -240,7 +240,10 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
   }
 
   if (req.method === "GET" && url.pathname === "/mark.js") {
-    const slug = url.searchParams.get("slug") ?? "default";
+    // Slug explicite dans l'URL uniquement quand l'installateur en veut un precis (plusieurs apps
+    // suivies separement sur un meme domaine). Le tag canonique n'en porte pas : il est alors
+    // resolu par domaine plus bas, comme le workspace et le project_id.
+    const requestedSlug = url.searchParams.get("slug");
     res.setHeader("Content-Type", "application/javascript; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
 
@@ -269,7 +272,7 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       return;
     }
 
-    let resolved: { workspace_id: string; project_id: string | null } | null = null;
+    let resolved: { workspace_id: string; project_id: string | null; slug: string | null } | null = null;
     try {
       resolved = await resolveByUrl(siteOrigin);
     } catch (error) {
@@ -283,6 +286,12 @@ async function handleRequestAsync(req: IncomingMessage, res: ServerResponse): Pr
       res.end("/* mark: domain not registered, tracking disabled */");
       return;
     }
+
+    // Priorite : slug explicite de l'URL, puis slug enregistre pour ce domaine, puis "default".
+    // Sans le deuxieme etage, le tag canonique (sans query string) faisait tomber TOUS les clients
+    // d'un workspace sous le meme slug "default", alors que le dashboard et les outils mark_*
+    // segmentent par slug : les donnees de deux clients s'y confondaient.
+    const slug = requestedSlug ?? resolved.slug ?? "default";
 
     res.writeHead(200);
     res.end(trackerScript(slug, resolved.workspace_id, resolved.project_id));

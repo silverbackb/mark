@@ -657,7 +657,7 @@ async function main(): Promise<void> {
   await runRetentionPurge();
   setInterval(runRetentionPurge, 24 * 60 * 60 * 1000);
 
-  const server = new McpServer({ name: "mark-mcp-server", version: "0.2.0" });
+  const server = new McpServer({ name: "mark-mcp-server", version: "0.2.1" });
 
   server.registerTool(
     "mark_snippet",

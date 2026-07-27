@@ -1,3 +1,27 @@
+## v0.2.1 — 2026-07-27
+
+### Corrigé
+
+Deux bugs trouvés en enregistrant le premier nouveau client depuis la sortie de la v0.2.0 —
+présents aussi bien sur une base fraîche que sur toute base existante d'avant la v0.2.0, donc
+concernant potentiellement toute installation self-hosted, pas seulement notre service cloud.
+
+- **`mark_snippet`/`POST /register` échouait systématiquement** (`400 { error: "Invalid JSON" }`,
+  message trompeur) sur toute table `snippets` créée avant l'introduction de `workspace_id` :
+  `CREATE TABLE IF NOT EXISTS` ne rejoue pas sa clause `UNIQUE(workspace_id, url)` sur une table
+  déjà existante, alors que `registerSnippet()` en a besoin pour son `ON CONFLICT`. `migrate()`
+  ajoute désormais cette contrainte de façon idempotente si elle manque, sans jamais faire planter
+  le démarrage du service en cas de doublons préexistants (log d'avertissement à la place).
+- **Un domaine enregistré sans protocole ne se retrouvait plus jamais.** `canonicalDomain` (Root)
+  est toujours stocké sans `https://`, mais un en-tête `Origin` de navigateur en a toujours un :
+  l'ancien `normalizeUrl` retournait la forme sans protocole telle quelle dès que `new URL()`
+  échouait, donc "mon-site.fr" et "https://mon-site.fr" ne matchaient jamais. Un client fraîchement
+  enregistré restait alors invisible pour toujours, ses événements partant en quarantaine sans
+  qu'aucun message n'indique pourquoi. `normalizeUrl` suppose désormais `https://` par défaut et
+  reste testée (7 cas).
+
+---
+
 ## v0.2.0 — 2026-07-27
 
 ### Rupture d'API — `slug` supprimé, `project_id` est l'identifiant

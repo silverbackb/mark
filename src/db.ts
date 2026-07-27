@@ -190,6 +190,33 @@ export async function migrate(): Promise<void> {
     EXCEPTION WHEN others THEN NULL;
     END $$
   `;
+  // Bug reel trouve en production le 2026-07-27 : sur une table snippets deja existante (creee
+  // avant l'introduction de workspace_id), CREATE TABLE IF NOT EXISTS ci-dessus est un no-op — la
+  // contrainte UNIQUE(workspace_id, url) qu'il declare ne s'applique donc jamais. registerSnippet()
+  // exige pourtant cette contrainte pour son ON CONFLICT(workspace_id, url) : sans elle, CHAQUE
+  // appel a mark_snippet/POST /register echoue au moment de planifier la requete (jamais au moment
+  // d'un vrai conflit), avec un message generique "Invalid JSON" qui masque la vraie cause. Notre
+  // base cloud tournait ainsi depuis l'introduction de workspace_id ; seuls les 3 clients deja
+  // enregistres avant cette introduction fonctionnaient.
+  //
+  // Try/catch cote applicatif plutot qu'un simple DO $$ ... EXCEPTION WHEN duplicate_object : une
+  // base self-hosted preexistante peut contenir des doublons (workspace_id, url), jamais empeches
+  // faute de cette contrainte. Dans ce cas l'ALTER echoue avec unique_violation, pas
+  // duplicate_object — et migrate() est awaited avant que le serveur HTTP ne demarre : la laisser
+  // remonter ferait planter TOUT le service au boot pour un probleme qui ne concerne que
+  // l'enregistrement de nouveaux domaines. On avertit et on continue plutot que de tout bloquer.
+  try {
+    await sql`ALTER TABLE snippets ADD CONSTRAINT snippets_workspace_id_url_key UNIQUE (workspace_id, url)`;
+  } catch (e) {
+    const code = (e as { code?: string } | null)?.code;
+    if (code !== "42710") { // duplicate_object : contrainte deja presente, rien a faire
+      console.error(
+        "[mark] impossible d'ajouter la contrainte UNIQUE(workspace_id, url) sur snippets " +
+        "(doublons preexistants ?) — l'enregistrement de nouveaux domaines restera casse tant " +
+        "que ces doublons n'auront pas ete resolus a la main :", e,
+      );
+    }
+  }
   // project_id : identite du client proprietaire de ce domaine, resolue par Origin/Referer plutot
   // qu'embarquee dans le snippet. Nullable : peuplee via POST /register, jamais devinee.
   await sql`ALTER TABLE snippets ADD COLUMN IF NOT EXISTS project_id TEXT`;

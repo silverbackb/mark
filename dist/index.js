@@ -601,7 +601,7 @@ async function main() {
     startHttpServer();
     await runRetentionPurge();
     setInterval(runRetentionPurge, 24 * 60 * 60 * 1000);
-    const server = new McpServer({ name: "mark-mcp-server", version: "0.2.0" });
+    const server = new McpServer({ name: "mark-mcp-server", version: "0.2.1" });
     server.registerTool("mark_snippet", {
         title: "Get Tracking Snippet",
         description: `Generate the HTML <script> tag to embed in your app for event tracking.
